@@ -1,0 +1,10 @@
+# build folder
+Ksnap-engine/build/
+
+# executable file
+Ksnap-engine/Ksync
+
+#Doxygen files
+Ksnap-engine/doxygen_docs/html/
+Ksnap-engine/doxygen_docs/latex/
+
