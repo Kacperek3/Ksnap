@@ -1,47 +1,11 @@
-#include <math.h>
+#include "parser/parser.h"
 #include <stdbool.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-
-#define DUMPER_LEN (sizeof("DUMP") - 1)
-#define RESTORER_LEN (sizeof("RESTOR") - 1)
 
 int main(int argc, char **argv) {
 
-    int opt;
-    int pid;
-    while ((opt = getopt(argc, argv, "m:p:hn")) != -1) {
-
-        switch (opt) {
-        case 'm':
-            if (!strncmp(optarg, "Dump", DUMPER_LEN)) {
-                printf("Dump chosen");
-                // Dumper init can be here
-            } else if (!strncmp(optarg, "Restore", RESTORER_LEN)) {
-                printf("Restor chosen");
-                // Restorer init can be here
-            } else {
-                printf("Wrong mode chosen");
-            }
-            break;
-
-        case 'p':
-            pid = atoi(optarg);
-            printf("pid is: %d\n", pid);
-            break;
-
-        case 'h':
-            printf("h flag added\n");
-            break;
-
-        case 'n':
-            printf("n flag added\n");
-            break;
-        }
-    }
+    parse_arg(argc, argv);
     /*
+     *
         // when we got 0 arguments - we exiting program
         if (argc == MODE_NOT_SPECIFIED) {
             printf("\n----------------------------------- \n");
