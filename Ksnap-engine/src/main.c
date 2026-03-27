@@ -3,7 +3,10 @@
 
 int main(int argc, char **argv) {
 
-    parse_arg(argc, argv);
+    ksync_config_t config;
+    ksync_status_t status;
+    status = parse_arg(argc, argv, &config);
+
     /*
      *
         // when we got 0 arguments - we exiting program

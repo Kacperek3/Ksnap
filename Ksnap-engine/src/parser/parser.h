@@ -12,10 +12,18 @@
 #define DUMPER_LEN (sizeof("DUMP") - 1)
 #define RESTORER_LEN (sizeof("RESTORE") - 1)
 
+typedef enum ksync_status_t {
+    KSNAP_OK = 0,
+    KSNAP_ERR_MISSING_ARGS = -1,
+    KSNAP_ERR_INVALID_PID = -2,
+    KSNAP_ERR_INVALID_MODE = -3,
+    KSANP_ERR_INVALID_NAME = -4,
+    KSNAP_ERR_TOO_MUCH_ARGS = -5
+} ksync_status_t;
+
 #define LIST_OF_MODES                                                          \
     X(DUMP)                                                                    \
-    X(RESTORE)                                                                 \
-    X(ERROR)
+    X(RESTORE)
 
 #define X(name) name,
 typedef enum modes_t { LIST_OF_MODES } modes_t;
@@ -38,32 +46,36 @@ typedef struct {
     char *output_dir;
 } ksync_config_t;
 
-static inline modes_t validate_mode(char *arg);
+static inline ksync_status_t validate_mode(char *arg, modes_t *mode);
 static inline void set_config_mode(ksync_config_t *config, modes_t mode);
 
-static inline bool validate_pid(char *arg);
+static inline ksync_status_t validate_pid(char *arg);
 static inline void set_config_pid(ksync_config_t *config, int pid);
 
-static inline ksync_config_t parse_arg(int argc, char **argv) {
-
+static inline ksync_status_t parse_arg(int argc, char **argv,
+                                       ksync_config_t *config) {
     int opt;
     int pid;
     modes_t mode;
-
-    ksync_config_t config = {0};
+    ksync_status_t status;
 
     while ((opt = getopt(argc, argv, "m:p:hn")) != -1) {
         switch (opt) {
         case 'm':
-            mode = validate_mode(optarg);
-            set_config_mode(&config, mode);
+            status = validate_mode(optarg, &mode);
+            set_config_mode(config, mode);
+            if (status < 0)
+                return status;
+
             break;
 
         case 'p':
             if (validate_pid(optarg)) {
                 pid = atoi(optarg);
-                set_config_pid(&config, pid);
+                set_config_pid(config, pid);
             }
+            if (status < 0)
+                return status;
             break;
 
         case 'h':
@@ -76,33 +88,34 @@ static inline ksync_config_t parse_arg(int argc, char **argv) {
         }
     }
 
-    return config;
+    return status;
 }
 
-static inline modes_t validate_mode(char *arg) {
+static inline ksync_status_t validate_mode(char *arg, modes_t *mode) {
     if (!strncmp(arg, "Dump", DUMPER_LEN)) {
-        return DUMP;
+        *mode = DUMP;
+        return KSNAP_OK;
     } else if (!strncmp(arg, "Restore", RESTORER_LEN)) {
-        return RESTORE;
+        *mode = RESTORE;
+        return KSNAP_OK;
     }
-    // handle unregonized mode
-    return ERROR;
+    return KSNAP_ERR_INVALID_MODE;
 }
 static inline void set_config_mode(ksync_config_t *config, modes_t mode) {
     config->mode = mode_to_string(mode);
 }
 
-static inline bool validate_pid(char *arg) {
+static inline ksync_status_t validate_pid(char *arg) {
     int size = strlen(arg);
     if (size > 7) {
-        return false;
+        return KSNAP_ERR_INVALID_PID;
     }
 
     for (int i = 0; i < size; i++) {
         if (!isdigit(arg[i]))
-            return false;
+            return KSNAP_ERR_INVALID_PID;
     }
-    return true;
+    return KSNAP_OK;
 }
 static inline void set_config_pid(ksync_config_t *config, int pid) {
     config->pid = pid;
