@@ -3,10 +3,19 @@
 
 int main(int argc, char **argv) {
 
+<<<<<<< Updated upstream
     ksync_config_t config;
     ksync_status_t status;
     status = parse_arg(argc, argv, &config);
 
+=======
+    ksnap_config_t config;
+    ksnap_status_t status;
+    status = parse_arg(argc, argv, &config);
+    if (!check_status(&status))
+        return 0;
+    printf("its good brother");
+>>>>>>> Stashed changes
     /*
      *
         // when we got 0 arguments - we exiting program

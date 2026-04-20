@@ -1,12 +1,11 @@
 CC := gcc  # compiler used for Ksync
-CFLAGS := -o #-g # flags (-g for debug info)
+CFLAGS := -o  # flags (-g for debug info)
 Files := src/main.c # our entry file
 
-TARGET_FILE := build/Ksync
+TARGET_FILE := build/Ksnap
 
 run:
-	$(CC) $(Files) $(CFLAGS) $(TARGET_FILE)
-	build/./Ksync
+	$(CC) -g $(Files) $(CFLAGS) $(TARGET_FILE)
 
 clean:
 	rm -f build/*
