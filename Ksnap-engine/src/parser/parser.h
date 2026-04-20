@@ -9,19 +9,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-<<<<<<< Updated upstream
-#define DUMPER_LEN (sizeof("DUMP") - 1)
-#define RESTORER_LEN (sizeof("RESTORE") - 1)
-
-typedef enum ksync_status_t {
-    KSNAP_OK = 0,
-    KSNAP_ERR_MISSING_ARGS = -1,
-    KSNAP_ERR_INVALID_PID = -2,
-    KSNAP_ERR_INVALID_MODE = -3,
-    KSANP_ERR_INVALID_NAME = -4,
-    KSNAP_ERR_TOO_MUCH_ARGS = -5
-} ksync_status_t;
-=======
 #define DUMP_LEN (sizeof("DUMP") - 1)
 #define RESTORE_LEN (sizeof("RESTORE") - 1)
 
@@ -36,7 +23,6 @@ typedef enum ksnap_status_t {
     KSNAP_ERR_TOO_MUCH_ARGS = -7,
     KSNAP_ERR_INVALID_ARGS = -8
 } ksnap_status_t;
->>>>>>> Stashed changes
 
 #define LIST_OF_MODES                                                          \
     X(DUMP)                                                                    \
@@ -61,22 +47,6 @@ typedef struct {
     int pid;
     char *file_name;
     char *output_dir;
-<<<<<<< Updated upstream
-} ksync_config_t;
-
-static inline ksync_status_t validate_mode(char *arg, modes_t *mode);
-static inline void set_config_mode(ksync_config_t *config, modes_t mode);
-
-static inline ksync_status_t validate_pid(char *arg);
-static inline void set_config_pid(ksync_config_t *config, int pid);
-
-static inline ksync_status_t parse_arg(int argc, char **argv,
-                                       ksync_config_t *config) {
-    int opt;
-    int pid;
-    modes_t mode;
-    ksync_status_t status;
-=======
 } ksnap_config_t;
 
 static inline ksnap_status_t validate_mode(char *arg, modes_t *mode);
@@ -101,31 +71,11 @@ static inline ksnap_status_t parse_arg(int argc, char **argv,
     int pid;
     modes_t mode;
     ksnap_status_t status = KSNAP_ERR_MISSING_ARGS;
->>>>>>> Stashed changes
 
     while ((opt = getopt(argc, argv, "m:p:hn")) != -1) {
         switch (opt) {
         case 'm':
             status = validate_mode(optarg, &mode);
-<<<<<<< Updated upstream
-            set_config_mode(config, mode);
-            if (status < 0)
-                return status;
-
-            break;
-
-        case 'p':
-            if (validate_pid(optarg)) {
-                pid = atoi(optarg);
-                set_config_pid(config, pid);
-            }
-            if (status < 0)
-                return status;
-            break;
-
-        case 'h':
-            printf("h flag added\n");
-=======
 
             if (status != KSNAP_OK)
                 return status;
@@ -159,7 +109,6 @@ static inline ksnap_status_t parse_arg(int argc, char **argv,
             printf("Example:\n");
             printf("  sudo ./Ksnap -m Dump -p 1234 -n memory_dump -d "
                    "/tmp/ksnap\n");
->>>>>>> Stashed changes
             break;
 
         case 'n':
@@ -168,16 +117,6 @@ static inline ksnap_status_t parse_arg(int argc, char **argv,
         }
     }
 
-<<<<<<< Updated upstream
-    return status;
-}
-
-static inline ksync_status_t validate_mode(char *arg, modes_t *mode) {
-    if (!strncmp(arg, "Dump", DUMPER_LEN)) {
-        *mode = DUMP;
-        return KSNAP_OK;
-    } else if (!strncmp(arg, "Restore", RESTORER_LEN)) {
-=======
     status = validate_mandatory_args(config);
     return status;
 }
@@ -193,26 +132,17 @@ static inline ksnap_status_t validate_mode(char *arg, modes_t *mode) {
         return KSNAP_OK;
     } else if (!strncmp(arg, "Restore", RESTORE_LEN) &&
                strlen(arg) == RESTORE_LEN) {
->>>>>>> Stashed changes
         *mode = RESTORE;
         return KSNAP_OK;
     }
     return KSNAP_ERR_INVALID_MODE;
 }
-<<<<<<< Updated upstream
-static inline void set_config_mode(ksync_config_t *config, modes_t mode) {
-    config->mode = mode_to_string(mode);
-}
-
-static inline ksync_status_t validate_pid(char *arg) {
-=======
 
 static inline void set_config_mode(ksnap_config_t *config, modes_t mode) {
     config->mode = mode_to_string(mode);
 }
 
 static inline ksnap_status_t validate_pid(char *arg) {
->>>>>>> Stashed changes
     int size = strlen(arg);
     if (size > 7) {
         return KSNAP_ERR_INVALID_PID;
@@ -224,12 +154,6 @@ static inline ksnap_status_t validate_pid(char *arg) {
     }
     return KSNAP_OK;
 }
-<<<<<<< Updated upstream
-static inline void set_config_pid(ksync_config_t *config, int pid) {
-    config->pid = pid;
-}
-
-=======
 static inline void set_config_pid(ksnap_config_t *config, int pid) {
     config->pid = pid;
 }
@@ -293,5 +217,4 @@ static inline bool check_status(ksnap_status_t *status) {
     return false;
 }
 
->>>>>>> Stashed changes
 #endif // !PARSER_H
