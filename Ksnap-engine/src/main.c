@@ -1,3 +1,6 @@
+
+#include "config.h"
+#include "dump/dumper.h"
 #include "parser/parser.h"
 #include <stdbool.h>
 
@@ -7,32 +10,8 @@ int main(int argc, char **argv) {
     ksnap_status_t status;
     status = parse_arg(argc, argv, &config);
     if (!check_status(&status))
-        return 0;
-    printf("its good brother");
-    /*
-     *
-        // when we got 0 arguments - we exiting program
-        if (argc == MODE_NOT_SPECIFIED) {
-            printf("\n----------------------------------- \n");
-            printf("|    Program requires 2 parameters  |\n");
-            printf("-----------------------------------\n");
-            printf("\nSee Ksync --help for more information \n\n");
-            return 0;
-        }
+        return EXIT;
 
-        // when we got above 3 arguments - we exit program
-        if (argc > MAX_PARAMS) {
-            printf("\n----------------------------------- \n");
-            printf("|    Program requires 2 parameters  |\n");
-            printf("-----------------------------------\n");
-            printf("\nSee Ksync --help for more information \n\n");
-            return 0;
-        }
-
-        if (!strncmp(argv[1], "Dumper", DUMPER_LEN)) {
-            int pid;
-            printf("pid is %d", pid);
-        }
-    */
+    dump(config);
     return 0;
 }

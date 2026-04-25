@@ -9,6 +9,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+// relative path right now but in future need to change in makefile
+#include "../config.h"
+//
+
 #define DUMP_LEN (sizeof("DUMP") - 1)
 #define RESTORE_LEN (sizeof("RESTORE") - 1)
 
@@ -41,13 +45,6 @@ static inline char *mode_to_string(modes_t mode) {
 #undef X
     }
 }
-
-typedef struct {
-    char *mode;
-    int pid;
-    char *file_name;
-    char *output_dir;
-} ksnap_config_t;
 
 static inline ksnap_status_t validate_mode(char *arg, modes_t *mode);
 static inline void set_config_mode(ksnap_config_t *config, modes_t mode);
@@ -176,19 +173,10 @@ static inline ksnap_status_t validate_mandatory_args(ksnap_config_t *config) {
     return KSNAP_OK;
 }
 
-/*KSNAP_OK = 0,
-KSNAP_ERR_INVALID_PID = -1,
-KSNAP_ERR_INVALID_MODE = -2,
-KSNAP_ERR_NO_MODE_SPECIFIED = -3,
-KSNAP_ERR_NO_PID_SPECIFIED = -4,
-KSNAP_ERR_INVALID_NAME = -5,
-KSNAP_ERR_MISSING_ARGS = -6,
-KSNAP_ERR_TOO_MUCH_ARGS = -7,
-KSNAP_ERR_INVALID_ARGS = -8*/
 static inline bool check_status(ksnap_status_t *status) {
     switch (*status) {
     case KSNAP_OK:
-        return true;
+        return OK;
     case KSNAP_ERR_INVALID_PID:
         fprintf(stderr, "Pid is incorrect\n");
         break;
@@ -214,7 +202,7 @@ static inline bool check_status(ksnap_status_t *status) {
         fprintf(stderr, "Invalid args \n");
         break;
     }
-    return false;
+    return ERROR;
 }
 
 #endif // !PARSER_H
