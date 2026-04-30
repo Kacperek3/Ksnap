@@ -1,3 +1,4 @@
+#include <stddef.h>
 #include <stdio.h>
 #include <sys/ptrace.h> // for ptrace
 #include <sys/user.h>   // for user_regs_struct
@@ -12,6 +13,12 @@
 #include <unistd.h>
 
 #include "dumper.h"
+#include <fcntl.h>
+
+typedef struct vma_segment_t {
+    unsigned long start_segment_address;
+    unsigned long segment_size;
+} vma_segment_t;
 
 void dump(ksnap_config_t config) {
     int status;
@@ -54,6 +61,10 @@ void dump(ksnap_config_t config) {
     char target_path[PATH_MAX];
     snprintf(process_path, sizeof(process_path), "/proc/%d/exe", config.pid);
     int len = readlink(process_path, target_path, sizeof(target_path) - 1);
+    if (len == -1) {
+        printf("error: cannot read exe path \n");
+        return;
+    }
     target_path[len] = '\0';
 
     file_handle = fopen("save/exe.bin", "wb+");
@@ -83,10 +94,53 @@ void dump(ksnap_config_t config) {
     char maps_line[256];
     snprintf(process_path, sizeof(process_path), "/proc/%d/maps", config.pid);
     file_handle = fopen(process_path, "r");
+
+    // ---------------------------
+    // for read /proc/pid/mem
+    int mem_file_handle;
+    char mem_process_path[PATH_MAX];
+    snprintf(mem_process_path, sizeof(mem_process_path), "/proc/%d/mem",
+             config.pid);
+    mem_file_handle = open(mem_process_path, O_RDONLY); // open for reading only
+    // ---------------------------
+
+    FILE *mem_dump_file_handle;
+    mem_dump_file_handle = fopen("save/mem.bin", "wb");
+
+    char privileges[5];
+    unsigned long finish_segment_address;
+    vma_segment_t seg;
+    char buff[4096];
     while (fgets(maps_line, sizeof(maps_line), file_handle) != NULL) {
-        printf("%s\n", maps_line);
+
+        sscanf(maps_line, "%lx-%lx %4s", &seg.start_segment_address,
+               &finish_segment_address, privileges);
+
+        seg.segment_size = finish_segment_address - seg.start_segment_address;
+
+        if (!strcmp(privileges, "rw-p")) {
+            // save start and end addresses in mem.bin
+            fwrite(&seg, sizeof(seg), 1, mem_dump_file_handle);
+            // open /proc/pid/mem folder
+            // 1. copy exact amount of bytes from start segment
+            unsigned long curr_send = 0;
+            unsigned long bytes_size = 4096;
+
+            while (curr_send < seg.segment_size) {
+                if (curr_send + 4096 > seg.segment_size) {
+                    bytes_size = seg.segment_size - curr_send;
+                }
+                pread(mem_file_handle, buff, bytes_size,
+                      seg.start_segment_address + curr_send);
+                // 2. write it into mem.bin
+                fwrite(buff, bytes_size, 1, mem_dump_file_handle);
+                curr_send += 4096;
+            }
+        }
     }
 
+    close(mem_file_handle);
     fclose(file_handle);
+    fclose(mem_dump_file_handle);
     ptrace(PTRACE_DETACH, config.pid, NULL, NULL); // waking the process
 }
