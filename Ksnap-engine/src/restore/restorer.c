@@ -1,8 +1,10 @@
 #include "restorer.h"
+#include <fcntl.h>
 #include <linux/limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <sys/personality.h>
 #include <sys/ptrace.h>
 #include <sys/types.h>
 #include <sys/user.h>
@@ -38,6 +40,7 @@ void restorer(ksnap_config_t config) {
         char *args[] = {exe_path, NULL};
         fclose(exe_file_handle);
 
+        personality(ADDR_NO_RANDOMIZE);
         ptrace(PTRACE_TRACEME, 0, NULL, NULL);
         execv(exe_path, args);
 
@@ -54,15 +57,8 @@ void restorer(ksnap_config_t config) {
             // 3. use nmap with syscalls to overwrite current memory
             // 4. wake up the child process
 
-            /* open a regs dump file
-            FILE *regs_file_handle;
-            regs_file_handle = fopen("save/regs.bin", "rb");
-            struct user_regs_struct regs;
-            fread(&regs, sizeof(struct user_regs_struct), 1, regs_file_handle);
-            fclose(regs_file_handle);
-            */
-
             //
+            // https://blog.rchapman.org/posts/Linux_System_Call_Table_for_x86_64/
             // 0F05 - syscall opcode
             // rax - 9 means for mmap
             // rdi - base address of virtual memory
@@ -73,6 +69,8 @@ void restorer(ksnap_config_t config) {
             // r9 - offset
             //
 
+            int mem_new_process_file_handle;
+
             FILE *mem_file_handle;
             mem_file_handle = fopen("save/mem.bin", "rb");
             if (mem_file_handle == NULL) {
@@ -80,6 +78,12 @@ void restorer(ksnap_config_t config) {
                 return;
             }
             vma_segment_t seg;
+
+            char buff[4096];
+            char process_mem_path[PATH_MAX];
+            snprintf(process_mem_path, sizeof(process_mem_path), "/proc/%d/mem",
+                     new_process);
+            mem_new_process_file_handle = open(process_mem_path, O_WRONLY);
 
             while (fread(&seg, sizeof(seg), 1, mem_file_handle) == 1) {
                 struct user_regs_struct regs;
@@ -118,8 +122,36 @@ void restorer(ksnap_config_t config) {
                 //---------------------------------------------------------
                 // here the memory will be write into new created segments
                 //---------------------------------------------------------
-                //....
+                unsigned long curr_read = 0;
+                unsigned long bytes_to_read_now = 4096;
+
+                while (curr_read < seg.segment_size) {
+
+                    if (curr_read + 4096 > seg.segment_size) {
+                        bytes_to_read_now = seg.segment_size - curr_read;
+                    }
+
+                    fread(buff, 1, bytes_to_read_now, mem_file_handle);
+
+                    pwrite(mem_new_process_file_handle, buff, bytes_to_read_now,
+                           seg.start_segment_address + curr_read);
+
+                    curr_read += bytes_to_read_now;
+                }
             }
+            close(mem_new_process_file_handle);
+            fclose(mem_file_handle);
+
+            FILE *regs_file_handle;
+            regs_file_handle = fopen("save/regs.bin", "rb");
+            struct user_regs_struct final_regs;
+            fread(&final_regs, sizeof(struct user_regs_struct), 1,
+                  regs_file_handle);
+            fclose(regs_file_handle);
+
+            ptrace(PTRACE_SETREGS, new_process, NULL, &final_regs);
+            ptrace(PTRACE_DETACH, new_process, NULL, NULL);
+            waitpid(new_process, &status, 0);
         }
     }
 
