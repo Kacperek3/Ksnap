@@ -15,6 +15,11 @@
 #include "dumper.h"
 #include <fcntl.h>
 
+#define MIN_LEN_PATH 0
+
+#define ERROR 0
+#define SUCCESS 1
+
 typedef struct vma_segment_t {
     unsigned long start_segment_address;
     unsigned long segment_size;
@@ -22,7 +27,6 @@ typedef struct vma_segment_t {
 
 void dump(ksnap_config_t config) {
     int status;
-    struct user_regs_struct regs;
 
     ptrace(PTRACE_SEIZE, config.pid, NULL,
            NULL); // attach process to our program
@@ -30,57 +34,65 @@ void dump(ksnap_config_t config) {
 
     waitpid(config.pid, &status, 0);
 
-    //-------------------------------------
-    // here the process is freezed
+    //-----------------------------------------------------------------------------
+    // Info: right now all of the dumped bytes are located in .../save/ path
+    // (later the path will be specified) here the process is freezed
 
-    ptrace(PTRACE_GETREGS, config.pid, NULL, &regs);
+    //-----------------------------------------------
+    // 1. Saving registers to file save/regs.bin
+    struct user_regs_struct regs;
+
+    ptrace(PTRACE_GETREGS, config.pid, NULL, &regs); // save regs
     FILE *file_handle;
 
     file_handle = fopen("save/regs.bin", "wb+");
     if (file_handle == NULL) {
         // handle it later
-        printf("error during opening the file(save/regs.bin) \n");
+        perror("Error during opening the file(save/regs.bin) \n");
         return;
     }
 
-    int flag = fwrite(&regs, sizeof(struct user_regs_struct), 1, file_handle);
-
-    if (!flag) {
-        printf("write operation failure");
-    } else {
-        printf("write regs succesfully \n");
+    if (fwrite(&regs, sizeof(struct user_regs_struct), 1, file_handle) ==
+        ERROR) {
+        perror("Write operation failure (save/regs.bin");
+        return;
     }
-    fclose(file_handle); // close connection to save/regs.bin
 
-    // folders important to dump/read
+    fclose(file_handle); // close connection to save/regs.bin
+    // -----------------------------------------------
+
+    // virtual folders important to dump
     // /proc/pid/mem        - physical memory areas
     // /proc/pid/maps       - areas important to save from mem
     // /proc/pid/exe        - path to executable program
 
+    //------------------------------------------------
+    // 2. Saving path to executable into save/exe.bin
     char process_path[64];
     char target_path[PATH_MAX];
     snprintf(process_path, sizeof(process_path), "/proc/%d/exe", config.pid);
-    int len = readlink(process_path, target_path, sizeof(target_path) - 1);
-    if (len == -1) {
-        printf("error: cannot read exe path \n");
+    int len = readlink(process_path, target_path,
+                       sizeof(target_path) -
+                           1); // read path from /proc/pid/exe symbolic link
+
+    if (len > MIN_LEN_PATH) {
+        perror("Error: cannot read exe path \n");
         return;
     }
     target_path[len] = '\0';
 
     file_handle = fopen("save/exe.bin", "wb+");
     if (file_handle == NULL) {
-        printf("error during opening the file (save/exe.bin) \n");
+        perror("Error during opening the file (save/exe.bin) \n");
         return;
     }
 
-    flag = fwrite(target_path, len, 1, file_handle);
-
-    if (!flag) {
-        printf("write operation failure");
-    } else {
-        printf("write exe succesfully \n");
+    if (fwrite(target_path, len, 1, file_handle) == ERROR) {
+        perror("Write operation failure (save/exe.bin)");
     }
+
     fclose(file_handle);
+    // --------------------------------------------------
 
     //
     // 1. need to analyse maps
