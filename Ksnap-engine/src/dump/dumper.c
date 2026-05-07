@@ -75,7 +75,7 @@ void dump(ksnap_config_t config) {
                        sizeof(target_path) -
                            1); // read path from /proc/pid/exe symbolic link
 
-    if (len > MIN_LEN_PATH) {
+    if (len <= MIN_LEN_PATH) {
         perror("Error: cannot read exe path \n");
         return;
     }
