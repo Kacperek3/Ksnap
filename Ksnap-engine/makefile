@@ -1,16 +1,20 @@
-.PHONY: clean, run
-
-
+.PHONY: all clean
 CC := gcc  # compiler used for Ksync
-CFLAGS := -o  # flags (-g for debug info)
-Files := src/main.c dump/dumper.c # our entry file
+CFLAGS := -g -Wall -Iinclude # flags (-g for debug info)
+SRCS := $(wildcard src/*.c)
+OBJS := $(SRCS:src/%.c=build/%.o)
 
-TARGET_FILE := build/Ksnap
+TARGET := build/Ksnap
 
-run:
-	$(CC) -g $(Files) $(CFLAGS) $(TARGET_FILE)
+all: $(TARGET)
+
+
+$(TARGET) : $(OBJS)
+	$(CC) $(OBJS) -o $(TARGET)
+
+build/%.o : src/%.c
+	@mkdir -p build
+	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f build/*
-
-
+	rm -rf build/*

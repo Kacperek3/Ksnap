@@ -2,6 +2,7 @@
 #include "config.h"
 #include "dump/dumper.h"
 #include "parser/parser.h"
+#include "restore/restorer.h"
 #include <stdbool.h>
 
 int main(int argc, char **argv) {
@@ -12,6 +13,10 @@ int main(int argc, char **argv) {
     if (!check_status(&status))
         return EXIT;
 
-    dump(config);
+    if (!strcmp(config.mode, "DUMP")) {
+        dump(config);
+    } else if (!strcmp(config.mode, "RESTORE")) {
+        restorer(config);
+    }
     return 0;
 }

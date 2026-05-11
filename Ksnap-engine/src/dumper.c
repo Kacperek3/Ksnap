@@ -48,7 +48,7 @@ void dump(ksnap_config_t config) {
     file_handle = fopen("save/regs.bin", "wb+");
     if (file_handle == NULL) {
         // handle it later
-        perror("Error during opening the file(save/regs.bin) \n");
+        perror("Error during opening the file(save/regs.bin)");
         return;
     }
 
@@ -76,19 +76,20 @@ void dump(ksnap_config_t config) {
                            1); // read path from /proc/pid/exe symbolic link
 
     if (len <= MIN_LEN_PATH) {
-        perror("Error: cannot read exe path \n");
+        perror("Error: cannot read exe path");
         return;
     }
     target_path[len] = '\0';
 
     file_handle = fopen("save/exe.bin", "wb+");
     if (file_handle == NULL) {
-        perror("Error during opening the file (save/exe.bin) \n");
+        perror("Error during opening the file (save/exe.bin)");
         return;
     }
 
-    if (fwrite(target_path, len, 1, file_handle) == ERROR) {
+    if (fwrite(target_path, len, 1, file_handle) != 1) {
         perror("Write operation failure (save/exe.bin)");
+        return;
     }
 
     fclose(file_handle);
@@ -103,9 +104,12 @@ void dump(ksnap_config_t config) {
     // 2. copy ares rw-p to file
     //
 
-    char maps_line[256];
     snprintf(process_path, sizeof(process_path), "/proc/%d/maps", config.pid);
     file_handle = fopen(process_path, "r");
+    if (file_handle == NULL) {
+        perror("Error during opening the virtual file (proc/pid/maps)");
+        return;
+    }
 
     // ---------------------------
     // for read /proc/pid/mem
@@ -118,11 +122,17 @@ void dump(ksnap_config_t config) {
 
     FILE *mem_dump_file_handle;
     mem_dump_file_handle = fopen("save/mem.bin", "wb");
+    if (mem_dump_file_handle == NULL) {
+        perror("Error during opening the file (save/mem.bin)");
+        return;
+    }
 
     char privileges[5];
     unsigned long finish_segment_address;
     vma_segment_t seg;
-    char buff[4096];
+    char buff[PAGE_SIZE]; // 4096
+    char maps_line[256];
+
     while (fgets(maps_line, sizeof(maps_line), file_handle) != NULL) {
 
         sscanf(maps_line, "%lx-%lx %4s", &seg.start_segment_address,
