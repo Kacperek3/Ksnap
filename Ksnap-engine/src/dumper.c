@@ -19,10 +19,11 @@
 #define ERROR 0
 #define SUCCESS 1
 
-typedef struct vma_segment_t {
-    unsigned long start_segment_address;
-    unsigned long segment_size;
-} vma_segment_t;
+// private functions
+static int dump_regs(pid_t pid, char *out_path);
+static int dump_exe_path(pid_t pid, char *out_path);
+static int dump_memory(pid_t pid, char *out_path);
+//
 
 void dump(ksnap_config_t config) {
     int status;
@@ -37,62 +38,109 @@ void dump(ksnap_config_t config) {
     // Info: right now all of the dumped bytes are located in .../save/ path
     // (later the path will be specified) here the process is freezed
 
+    // virtual folders important to dump
+    // /proc/pid/mem        - physical memory areas
+    // /proc/pid/maps       - areas important to save from mem
+    // /proc/pid/exe        - path to executable program
+
+    // 1.
+    dump_regs(config.pid, config.output_dir);
+    // 2.
+    dump_exe_path(config.pid, config.output_dir);
+    // 3.
+    dump_memory(config.pid, config.output_dir);
+
+    // waking the process
+    ptrace(PTRACE_DETACH, config.pid, NULL, NULL);
+}
+
+static int dump_regs(pid_t pid, char *out_path) {
     //-----------------------------------------------
     // 1. Saving registers to file save/regs.bin
     struct user_regs_struct regs;
 
-    ptrace(PTRACE_GETREGS, config.pid, NULL, &regs); // save regs
+    ptrace(PTRACE_GETREGS, pid, NULL, &regs); // save regs
     FILE *file_handle;
 
     file_handle = fopen("../save/regs.bin", "wb+");
     if (file_handle == NULL) {
         // handle it later
         perror("Error during opening the file(save/regs.bin)");
-        return;
+        return ERROR;
     }
 
     if (fwrite(&regs, sizeof(struct user_regs_struct), 1, file_handle) ==
         ERROR) {
         perror("Write operation failure (save/regs.bin");
-        return;
+        return ERROR;
     }
 
     fclose(file_handle); // close connection to save/regs.bin
     // -----------------------------------------------
+    return OK;
+}
 
-    // virtual folders important to dump
-    // /proc/pid/mem        - physical memory areas
-    // /proc/pid/maps       - areas important to save from mem
-    // /proc/pid/exe        - path to executable program
-
+static int dump_exe_path(pid_t pid, char *out_path) {
     //------------------------------------------------
     // 2. Saving path to executable into save/exe.bin
     char process_path[64];
     char target_path[PATH_MAX];
-    snprintf(process_path, sizeof(process_path), "/proc/%d/exe", config.pid);
+    snprintf(process_path, sizeof(process_path), "/proc/%d/exe", pid);
     int len = readlink(process_path, target_path,
                        sizeof(target_path) -
                            1); // read path from /proc/pid/exe symbolic link
 
     if (len <= MIN_LEN_PATH) {
         perror("Error: cannot read exe path");
-        return;
+        return ERROR;
     }
     target_path[len] = '\0';
 
-    file_handle = fopen("../save/exe.bin", "wb+");
+    FILE *file_handle = fopen("../save/exe.bin", "wb+");
     if (file_handle == NULL) {
         perror("Error during opening the file (save/exe.bin)");
-        return;
+        return ERROR;
     }
 
     if (fwrite(target_path, len, 1, file_handle) != 1) {
         perror("Write operation failure (save/exe.bin)");
-        return;
+        return ERROR;
     }
 
     fclose(file_handle);
     // --------------------------------------------------
+    return OK;
+}
+
+static int dump_memory(pid_t pid, char *output_dir) {
+    char process_path[64];
+    snprintf(process_path, sizeof(process_path), "/proc/%d/maps", pid);
+    FILE *file_handle = fopen(process_path, "r");
+    if (file_handle == NULL) {
+        perror("Error during opening the virtual file (proc/pid/maps)");
+        return ERROR;
+    }
+
+    // ---------------------------
+    // for read /proc/pid/mem
+    int mem_file_handle;
+    char mem_process_path[PATH_MAX];
+    snprintf(mem_process_path, sizeof(mem_process_path), "/proc/%d/mem", pid);
+    mem_file_handle = open(mem_process_path, O_RDONLY); // open for reading only
+    // ---------------------------
+
+    FILE *mem_dump_file_handle;
+    mem_dump_file_handle = fopen("../save/mem.bin", "wb");
+    if (mem_dump_file_handle == NULL) {
+        perror("Error during opening the file (save/mem.bin)");
+        return ERROR;
+    }
+
+    char privileges[5];
+    unsigned long finish_segment_address;
+    vma_segment_t seg;
+    char buff[PAGE_SIZE]; // 4096
+    char maps_line[256];
 
     //
     // 1. need to analyse maps
@@ -102,35 +150,6 @@ void dump(ksnap_config_t config) {
     //
     // 2. copy ares rw-p to file
     //
-
-    snprintf(process_path, sizeof(process_path), "/proc/%d/maps", config.pid);
-    file_handle = fopen(process_path, "r");
-    if (file_handle == NULL) {
-        perror("Error during opening the virtual file (proc/pid/maps)");
-        return;
-    }
-
-    // ---------------------------
-    // for read /proc/pid/mem
-    int mem_file_handle;
-    char mem_process_path[PATH_MAX];
-    snprintf(mem_process_path, sizeof(mem_process_path), "/proc/%d/mem",
-             config.pid);
-    mem_file_handle = open(mem_process_path, O_RDONLY); // open for reading only
-    // ---------------------------
-
-    FILE *mem_dump_file_handle;
-    mem_dump_file_handle = fopen("../save/mem.bin", "wb");
-    if (mem_dump_file_handle == NULL) {
-        perror("Error during opening the file (save/mem.bin)");
-        return;
-    }
-
-    char privileges[5];
-    unsigned long finish_segment_address;
-    vma_segment_t seg;
-    char buff[PAGE_SIZE]; // 4096
-    char maps_line[256];
 
     while (fgets(maps_line, sizeof(maps_line), file_handle) != NULL) {
 
@@ -163,5 +182,7 @@ void dump(ksnap_config_t config) {
     close(mem_file_handle);
     fclose(file_handle);
     fclose(mem_dump_file_handle);
-    ptrace(PTRACE_DETACH, config.pid, NULL, NULL); // waking the process
+
+    // -----------------------------------------------
+    return OK;
 }
