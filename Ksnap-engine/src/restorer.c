@@ -17,7 +17,6 @@ typedef struct vma_segment_t {
 } vma_segment_t;
 
 void restorer(ksnap_config_t config) {
-    printf("parent process \n");
     pid_t new_process = fork();
     if (new_process < 0) {
         perror("fork fail");
@@ -26,7 +25,7 @@ void restorer(ksnap_config_t config) {
         // child process here
         char exe_path[PATH_MAX];
         FILE *exe_file_handle;
-        exe_file_handle = fopen("save/exe.bin", "rb");
+        exe_file_handle = fopen("../save/exe.bin", "rb");
         if (exe_file_handle == NULL) {
             perror("error during open file\n");
         }
@@ -72,7 +71,7 @@ void restorer(ksnap_config_t config) {
             int mem_new_process_file_handle;
 
             FILE *mem_file_handle;
-            mem_file_handle = fopen("save/mem.bin", "rb");
+            mem_file_handle = fopen("../save/mem.bin", "rb");
             if (mem_file_handle == NULL) {
                 perror("save/mem.bin file could't be opened");
                 return;
@@ -143,7 +142,7 @@ void restorer(ksnap_config_t config) {
             fclose(mem_file_handle);
 
             FILE *regs_file_handle;
-            regs_file_handle = fopen("save/regs.bin", "rb");
+            regs_file_handle = fopen("../save/regs.bin", "rb");
             struct user_regs_struct final_regs;
             fread(&final_regs, sizeof(struct user_regs_struct), 1,
                   regs_file_handle);

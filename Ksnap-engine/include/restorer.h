@@ -3,7 +3,7 @@
 
 #include <stdio.h>
 
-#include "../config.h"
+#include "config.h"
 
 void restorer(ksnap_config_t);
 

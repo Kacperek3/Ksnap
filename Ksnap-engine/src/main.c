@@ -1,8 +1,8 @@
 
 #include "config.h"
-#include "dump/dumper.h"
-#include "parser/parser.h"
-#include "restore/restorer.h"
+#include "dumper.h"
+#include "parser.h"
+#include "restorer.h"
 #include <stdbool.h>
 
 int main(int argc, char **argv) {

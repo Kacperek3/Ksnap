@@ -8,7 +8,6 @@
 
 #include <dirent.h>
 #include <linux/limits.h>
-#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -45,7 +44,7 @@ void dump(ksnap_config_t config) {
     ptrace(PTRACE_GETREGS, config.pid, NULL, &regs); // save regs
     FILE *file_handle;
 
-    file_handle = fopen("save/regs.bin", "wb+");
+    file_handle = fopen("../save/regs.bin", "wb+");
     if (file_handle == NULL) {
         // handle it later
         perror("Error during opening the file(save/regs.bin)");
@@ -81,7 +80,7 @@ void dump(ksnap_config_t config) {
     }
     target_path[len] = '\0';
 
-    file_handle = fopen("save/exe.bin", "wb+");
+    file_handle = fopen("../save/exe.bin", "wb+");
     if (file_handle == NULL) {
         perror("Error during opening the file (save/exe.bin)");
         return;
@@ -121,7 +120,7 @@ void dump(ksnap_config_t config) {
     // ---------------------------
 
     FILE *mem_dump_file_handle;
-    mem_dump_file_handle = fopen("save/mem.bin", "wb");
+    mem_dump_file_handle = fopen("../save/mem.bin", "wb");
     if (mem_dump_file_handle == NULL) {
         perror("Error during opening the file (save/mem.bin)");
         return;

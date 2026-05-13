@@ -1,5 +1,5 @@
 .PHONY: all clean
-CC := gcc  # compiler used for Ksync
+CC := gcc  # compiler used for Ksnap
 CFLAGS := -g -Wall -Iinclude # flags (-g for debug info)
 SRCS := $(wildcard src/*.c)
 OBJS := $(SRCS:src/%.c=build/%.o)

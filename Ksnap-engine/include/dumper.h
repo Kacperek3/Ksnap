@@ -3,7 +3,7 @@
 
 #include <stdio.h>
 
-#include "../config.h"
+#include "config.h"
 
 // create snapshot of process
 void dump(ksnap_config_t);

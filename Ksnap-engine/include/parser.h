@@ -10,7 +10,7 @@
 #include <string.h>
 
 // relative path right now but in future need to change in makefile
-#include "../config.h"
+#include "config.h"
 //
 
 #define DUMP_LEN (sizeof("DUMP") - 1)
@@ -44,6 +44,7 @@ static inline char *mode_to_string(modes_t mode) {
         LIST_OF_MODES
 #undef X
     }
+    return NULL;
 }
 
 static inline ksnap_status_t validate_mode(char *arg, modes_t *mode);
