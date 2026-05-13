@@ -11,10 +11,12 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-typedef struct vma_segment_t {
-    unsigned long start_segment_address;
-    unsigned long segment_size;
-} vma_segment_t;
+// private functions
+static int spawn_traced_child(char *exe_path);
+// inject_mmap_syscall(pid, seg);
+// restore_segment_data(mem_fd, src_file, seg);
+// restore_regs(pid, path);
+// ------
 
 void restorer(ksnap_config_t config) {
     pid_t new_process = fork();
@@ -23,28 +25,7 @@ void restorer(ksnap_config_t config) {
         return;
     } else if (new_process == 0) {
         // child process here
-        char exe_path[PATH_MAX];
-        FILE *exe_file_handle;
-        exe_file_handle = fopen("../save/exe.bin", "rb");
-        if (exe_file_handle == NULL) {
-            perror("error during open file\n");
-        }
-
-        fseek(exe_file_handle, 0, SEEK_END);
-        int exe_path_size = ftell(exe_file_handle);
-        fseek(exe_file_handle, 0, SEEK_SET);
-
-        fread(exe_path, sizeof(char), exe_path_size, exe_file_handle);
-        exe_path[exe_path_size] = '\0';
-        char *args[] = {exe_path, NULL};
-        fclose(exe_file_handle);
-
-        personality(ADDR_NO_RANDOMIZE);
-        ptrace(PTRACE_TRACEME, 0, NULL, NULL);
-        execv(exe_path, args);
-
-        perror("execv failed");
-        exit(0);
+        spawn_traced_child(config.output_dir);
     } else {
         // parent process here
         int status;
@@ -155,4 +136,28 @@ void restorer(ksnap_config_t config) {
     }
 
     return;
+}
+
+static int spawn_traced_child(char *exe_path) {
+    FILE *exe_file_handle;
+    exe_file_handle = fopen("../save/exe.bin", "rb");
+    if (exe_file_handle == NULL) {
+        perror("error during open file\n");
+    }
+
+    fseek(exe_file_handle, 0, SEEK_END);
+    int exe_path_size = ftell(exe_file_handle);
+    fseek(exe_file_handle, 0, SEEK_SET);
+
+    fread(exe_path, sizeof(char), exe_path_size, exe_file_handle);
+    exe_path[exe_path_size] = '\0';
+    char *args[] = {exe_path, NULL};
+    fclose(exe_file_handle);
+
+    personality(ADDR_NO_RANDOMIZE);
+    ptrace(PTRACE_TRACEME, 0, NULL, NULL);
+    execv(exe_path, args);
+
+    perror("execv failed");
+    exit(0);
 }

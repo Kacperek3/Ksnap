@@ -16,4 +16,9 @@ typedef struct {
     char *output_dir;
 } ksnap_config_t;
 
+typedef struct vma_segment_t {
+    unsigned long start_segment_address;
+    unsigned long segment_size;
+} vma_segment_t;
+
 #endif // !CONFIG_H
