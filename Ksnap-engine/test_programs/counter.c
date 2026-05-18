@@ -22,7 +22,8 @@ int main() {
     printf("-------------------------------\n\n");
 
     for (int i = 0; i < 100; i++) {
-        printf("Index is: %d \n", i);
+        printf("%d \n", i);
+        fflush(stdout);
         sleep(1);
     }
 

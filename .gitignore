@@ -8,3 +8,8 @@ Ksnap-engine/Ksync
 Ksnap-engine/doxygen_docs/html/
 Ksnap-engine/doxygen_docs/latex/
 
+# nvim info
+Ksnap-engine/compile_commands.json
+
+Ksnap-engine/save/
+Ksnap-engine/.cache/

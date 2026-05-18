@@ -1,14 +1,23 @@
-CC := gcc  # compiler used for Ksync
-CFLAGS := -o #-g # flags (-g for debug info)
-Files := src/main.c # our entry file
+.PHONY: all clean test
+CC := gcc  # compiler used for Ksnap
+CFLAGS := -g -Wall -Iinclude # flags (-g for debug info)
+SRCS := $(wildcard src/*.c)
+OBJS := $(SRCS:src/%.c=build/%.o)
 
-TARGET_FILE := build/Ksync
+TARGET := build/Ksnap
 
-run:
-	$(CC) $(Files) $(CFLAGS) $(TARGET_FILE)
-	build/./Ksync
+all: $(TARGET)
+
+
+$(TARGET) : $(OBJS)
+	$(CC) $(OBJS) -o $(TARGET)
+
+build/%.o : src/%.c
+	@mkdir -p build
+	$(CC) $(CFLAGS) -c $< -o $@
+
+test:
+	test/./test.sh
 
 clean:
-	rm -f build/*
-
-
+	rm -rf build/*
