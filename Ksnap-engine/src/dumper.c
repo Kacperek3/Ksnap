@@ -16,9 +16,6 @@
 
 #define MIN_LEN_PATH 0
 
-#define ERROR 0
-#define SUCCESS 1
-
 // private functions
 static int dump_regs(pid_t pid, char *out_path);
 static int dump_exe_path(pid_t pid, char *out_path);
