@@ -17,7 +17,7 @@ build/%.o : src/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 test:
-	test/./test.sh
+	test/./test_static_noPie.sh
 
 clean:
 	rm -rf build/*

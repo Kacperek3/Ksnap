@@ -13,3 +13,6 @@ Ksnap-engine/compile_commands.json
 
 Ksnap-engine/save/
 Ksnap-engine/.cache/
+
+# skip all executable files
+*.elf

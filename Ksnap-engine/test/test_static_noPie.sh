@@ -14,7 +14,7 @@ PID=$!
 sleep 5
 
 echo "Making process dump $PID..."
-../build/Ksnap -m Dump -p $PID
+sudo ../build/./Ksnap -m Dump -p $PID
 
 LAST_VAL=$(tail -n 1 ../test/logs.txt)
 
@@ -24,7 +24,7 @@ wait $PID 2>/dev/null
 echo "Dump made on value: $LAST_VAL"
 echo "Restoring process..."
 
-../build/Ksnap -m Restore &
+sudo ../build/./Ksnap -m Restore &
 NEW_PID=$!
 sleep 2
 

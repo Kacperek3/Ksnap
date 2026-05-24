@@ -11,16 +11,19 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "config.h"
 #include "dumper.h"
 #include <fcntl.h>
 
 #define MIN_LEN_PATH 0
 
-// private functions
+// private main functions
 static int dump_regs(pid_t pid, char *out_path);
 static int dump_exe_path(pid_t pid, char *out_path);
 static int dump_memory(pid_t pid, char *out_path);
 //
+static int save_to_mem_bin(FILE *mem_dump_handle, int mem_vma_handle,
+                           vma_segment_t seg, char buff[]);
 
 void dump(ksnap_config_t config) {
     int status;
@@ -138,6 +141,7 @@ static int dump_memory(pid_t pid, char *output_dir) {
     vma_segment_t seg;
     char buff[PAGE_SIZE]; // 4096
     char maps_line[256];
+    char maps_path[256];
 
     //
     // 1. need to analyse maps
@@ -150,30 +154,23 @@ static int dump_memory(pid_t pid, char *output_dir) {
 
     while (fgets(maps_line, sizeof(maps_line), file_handle) != NULL) {
 
-        sscanf(maps_line, "%lx-%lx %4s", &seg.start_segment_address,
-               &finish_segment_address, privileges);
+        sscanf(maps_line, "%lx-%lx %4s %*x %*x:%*x %*lu %255s",
+               &seg.start_segment_address, &finish_segment_address, privileges,
+               maps_path);
 
         seg.segment_size = finish_segment_address - seg.start_segment_address;
 
-        if (!strcmp(privileges, "rw-p")) {
-            // save start and end addresses in mem.bin
-            fwrite(&seg, sizeof(seg), 1, mem_dump_file_handle);
-            // open /proc/pid/mem folder
-            // 1. copy exact amount of bytes from start segment
-            unsigned long curr_send = 0;
-            unsigned long bytes_size = 4096;
+        if (privileges[0] != 'r')
+            continue; // segment must be readable
+        if (privileges[3] != 'p')
+            continue; // segment memory must be private
 
-            while (curr_send < seg.segment_size) {
-                if (curr_send + 4096 > seg.segment_size) {
-                    bytes_size = seg.segment_size - curr_send;
-                }
-                pread(mem_file_handle, buff, bytes_size,
-                      seg.start_segment_address + curr_send);
-                // 2. write it into mem.bin
-                fwrite(buff, bytes_size, 1, mem_dump_file_handle);
-                curr_send += 4096;
-            }
-        }
+        if (strcmp(maps_path, "[vvar]") == 0 ||
+            strcmp(maps_path, "[vdso]") == 0 ||
+            strcmp(maps_path, "[vsyscall]") == 0)
+            continue;
+
+        save_to_mem_bin(mem_dump_file_handle, mem_file_handle, seg, buff);
     }
 
     close(mem_file_handle);
@@ -181,5 +178,28 @@ static int dump_memory(pid_t pid, char *output_dir) {
     fclose(mem_dump_file_handle);
 
     // -----------------------------------------------
+    return OK;
+}
+
+static int save_to_mem_bin(FILE *mem_dump_handle, int mem_vma_handle,
+                           vma_segment_t seg, char buff[]) {
+
+    // save start and end addresses in mem.bin
+    fwrite(&seg, sizeof(seg), 1, mem_dump_handle);
+    // open /proc/pid/mem folder
+    // 1. copy exact amount of bytes from start segment
+    unsigned long curr_send = 0;
+    unsigned long bytes_size = 4096;
+
+    while (curr_send < seg.segment_size) {
+        if (curr_send + 4096 > seg.segment_size) {
+            bytes_size = seg.segment_size - curr_send;
+        }
+        pread(mem_vma_handle, buff, bytes_size,
+              seg.start_segment_address + curr_send);
+        // 2. write it into mem.bin
+        fwrite(buff, bytes_size, 1, mem_dump_handle);
+        curr_send += 4096;
+    }
     return OK;
 }
