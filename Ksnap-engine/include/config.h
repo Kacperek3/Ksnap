@@ -7,6 +7,9 @@
 #define OK 1
 
 #define EXIT 0
+
+// shortest accepted path length
+#define MIN_LEN_PATH 0
 // ---------------------
 
 typedef struct {

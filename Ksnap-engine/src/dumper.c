@@ -15,8 +15,6 @@
 #include "dumper.h"
 #include <fcntl.h>
 
-#define MIN_LEN_PATH 0
-
 // private main functions
 static int dump_regs(pid_t pid, char *out_path);
 static int dump_exe_path(pid_t pid, char *out_path);

@@ -14,5 +14,7 @@ Ksnap-engine/compile_commands.json
 Ksnap-engine/save/
 Ksnap-engine/.cache/
 
+Ksnap-engine/test/logs.txt/
+
 # skip all executable files
 *.elf

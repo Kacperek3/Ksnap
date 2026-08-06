@@ -15,7 +15,7 @@
 #define CHILD 0
 
 // private functions
-static int spawn_traced_child(char *exe_path);
+static int spawn_traced_child(const char *dump_path);
 static int set_final_regs(pid_t pid);
 // inject_mmap_syscall(pid, seg);
 // restore_segment_data(mem_fd, src_file, seg);
@@ -137,18 +137,37 @@ void restorer(ksnap_config_t config) {
     return;
 }
 
-static int spawn_traced_child(char *exe_path) {
+static int spawn_traced_child(const char *dump_path) {
+    // the path saved by the dumper must land in our own buffer
+    // (dump_path is read-only and only points to save/exe.bin)
+    char exe_path[PATH_MAX];
+
     FILE *exe_file_handle;
-    exe_file_handle = fopen(exe_path, "rb");
+    exe_file_handle = fopen(dump_path, "rb");
     if (exe_file_handle == NULL) {
-        perror("Error during opening the file");
+        perror("Error during opening the file (save/exe.bin)");
+        exit(EXIT_FAILURE); // we are in the child, so no way back
     }
 
     fseek(exe_file_handle, 0, SEEK_END);
-    int exe_path_size = ftell(exe_file_handle);
+    long exe_path_size = ftell(exe_file_handle);
     fseek(exe_file_handle, 0, SEEK_SET);
 
-    fread(exe_path, sizeof(char), exe_path_size, exe_file_handle);
+    // path must fit into the buffer together with the terminating '\0'
+    if (exe_path_size <= MIN_LEN_PATH ||
+        exe_path_size >= (long)sizeof(exe_path)) {
+        fprintf(stderr, "Error: wrong exe path size (save/exe.bin)\n");
+        fclose(exe_file_handle);
+        exit(EXIT_FAILURE);
+    }
+
+    if (fread(exe_path, sizeof(char), exe_path_size, exe_file_handle) !=
+        (size_t)exe_path_size) {
+        perror("Read operation failure (save/exe.bin)");
+        fclose(exe_file_handle);
+        exit(EXIT_FAILURE);
+    }
+
     exe_path[exe_path_size] = '\0';
     char *args[] = {exe_path, NULL};
     fclose(exe_file_handle);
@@ -158,7 +177,7 @@ static int spawn_traced_child(char *exe_path) {
     execv(exe_path, args);
 
     perror("execv failed");
-    exit(0);
+    exit(EXIT_FAILURE);
 }
 
 static int set_final_regs(pid_t pid) {
