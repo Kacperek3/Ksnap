@@ -8,12 +8,16 @@
 
 #include <dirent.h>
 #include <linux/limits.h>
+#include <stdbool.h>
 #include <string.h>
 #include <unistd.h>
 
 #include "config.h"
 #include "dumper.h"
 #include <fcntl.h>
+
+#define MAPS_PATH_WIDTH "4095"
+_Static_assert(PATH_MAX == 4096, "MAPS_PATH_WIDTH must be PATH_MAX - 1");
 
 // private main functions
 static int dump_regs(pid_t pid, char *out_path);
@@ -22,6 +26,9 @@ static int dump_memory(pid_t pid, char *out_path);
 //
 static int save_to_mem_bin(FILE *mem_dump_handle, int mem_vma_handle,
                            vma_segment_t seg, char buff[]);
+static bool parse_maps_line(const char *maps_line, vma_segment_t *seg,
+                            char privileges[5], char maps_path[PATH_MAX]);
+static bool is_dumpable_path(const char *maps_path);
 
 void dump(ksnap_config_t config) {
     int status;
@@ -135,38 +142,37 @@ static int dump_memory(pid_t pid, char *output_dir) {
     }
 
     char privileges[5];
-    unsigned long finish_segment_address;
     vma_segment_t seg;
     char buff[PAGE_SIZE]; // 4096
-    char maps_line[256];
-    char maps_path[256];
+    char maps_line[PATH_MAX + 128];
+    char maps_path[PATH_MAX];
 
     //
     // 1. need to analyse maps
     // format is like this to parse
     // 08048000-08049000 r-xp 00000000 03:00 8312       /opt/test
     // 08049000-0804a000 rw-p 00001000 03:00 8312       /opt/test
+    // 08050000-08051000 rw-p 00000000 00:00 0
+    // the last field is optional - anonymous mappings carry no path
     //
     // 2. copy ares rw-p to file
     //
 
     while (fgets(maps_line, sizeof(maps_line), file_handle) != NULL) {
 
-        sscanf(maps_line, "%lx-%lx %4s %*x %*x:%*x %*lu %255s",
-               &seg.start_segment_address, &finish_segment_address, privileges,
-               maps_path);
-
-        seg.segment_size = finish_segment_address - seg.start_segment_address;
+        if (!parse_maps_line(maps_line, &seg, privileges, maps_path)) {
+            fprintf(stderr, "Warning: unparsable maps line skipped: %s",
+                    maps_line);
+            continue;
+        }
 
         if (privileges[0] != 'r')
             continue; // segment must be readable
         if (privileges[3] != 'p')
             continue; // segment memory must be private
 
-        if (strcmp(maps_path, "[vvar]") == 0 ||
-            strcmp(maps_path, "[vdso]") == 0 ||
-            strcmp(maps_path, "[vsyscall]") == 0)
-            continue;
+        if (!is_dumpable_path(maps_path))
+            continue; // kernel owned pseudo mapping
 
         save_to_mem_bin(mem_dump_file_handle, mem_file_handle, seg, buff);
     }
@@ -200,4 +206,38 @@ static int save_to_mem_bin(FILE *mem_dump_handle, int mem_vma_handle,
         curr_send += 4096;
     }
     return OK;
+}
+
+static bool parse_maps_line(const char *maps_line, vma_segment_t *seg,
+                            char privileges[5], char maps_path[PATH_MAX]) {
+    unsigned long finish_segment_address;
+
+    privileges[0] = '\0';
+    maps_path[0] = '\0';
+
+    int parsed_fields =
+        sscanf(maps_line, "%lx-%lx %4s %*s %*s %*s %" MAPS_PATH_WIDTH "s",
+               &seg->start_segment_address, &finish_segment_address, privileges,
+               maps_path);
+
+    // address range plus privileges are mandatory, the path is not
+    if (parsed_fields < 3)
+        return false;
+
+    if (strlen(privileges) != 4)
+        return false;
+
+    if (finish_segment_address <= seg->start_segment_address)
+        return false;
+
+    seg->segment_size = finish_segment_address - seg->start_segment_address;
+    return true;
+}
+
+static bool is_dumpable_path(const char *maps_path) {
+    if (maps_path[0] != '[')
+        return true; // anonymous mapping or a regular file
+
+    return strcmp(maps_path, "[heap]") == 0 ||
+           strcmp(maps_path, "[stack]") == 0;
 }
