@@ -7,6 +7,7 @@
 #include <sys/wait.h> // for waitpid
 
 #include <dirent.h>
+#include <errno.h>
 #include <linux/limits.h>
 #include <stdbool.h>
 #include <string.h>
@@ -30,14 +31,33 @@ static bool parse_maps_line(const char *maps_line, vma_segment_t *seg,
                             char privileges[5], char maps_path[PATH_MAX]);
 static bool is_dumpable_path(const char *maps_path);
 
-void dump(ksnap_config_t config) {
+int dump(ksnap_config_t config) {
     int status;
+    int result = ERROR;
 
-    ptrace(PTRACE_SEIZE, config.pid, NULL,
-           NULL); // attach process to our program
-    ptrace(PTRACE_INTERRUPT, config.pid, NULL, NULL); // stoping tracee
+    // attach process to our program
+    if (ptrace(PTRACE_SEIZE, config.pid, NULL, NULL) == -1) {
+        fprintf(stderr, "Error: cannot seize process %d: %s\n", config.pid,
+                strerror(errno));
+        return ERROR;
+    }
 
-    waitpid(config.pid, &status, 0);
+    // from here on the target is ours, so every exit has to detach it again
+    if (ptrace(PTRACE_INTERRUPT, config.pid, NULL, NULL) == -1) { // stop tracee
+        perror("Error: cannot interrupt the target process");
+        goto detach;
+    }
+
+    if (waitpid(config.pid, &status, 0) == -1) {
+        perror("Error: waiting for the target to stop failed");
+        goto detach;
+    }
+
+    if (!WIFSTOPPED(status)) {
+        fprintf(stderr, "Error: process %d did not stop for the dump\n",
+                config.pid);
+        goto detach;
+    }
 
     //-----------------------------------------------------------------------------
     // Info: right now all of the dumped bytes are located in .../save/ path
@@ -49,14 +69,25 @@ void dump(ksnap_config_t config) {
     // /proc/pid/exe        - path to executable program
 
     // 1.
-    dump_regs(config.pid, config.output_dir);
+    if (dump_regs(config.pid, config.output_dir) != OK)
+        goto detach;
     // 2.
-    dump_exe_path(config.pid, config.output_dir);
+    if (dump_exe_path(config.pid, config.output_dir) != OK)
+        goto detach;
     // 3.
-    dump_memory(config.pid, config.output_dir);
+    if (dump_memory(config.pid, config.output_dir) != OK)
+        goto detach;
 
+    result = OK;
+
+detach:
     // waking the process
-    ptrace(PTRACE_DETACH, config.pid, NULL, NULL);
+    if (ptrace(PTRACE_DETACH, config.pid, NULL, NULL) == -1) {
+        perror("Error: cannot detach from the target process");
+        result = ERROR;
+    }
+
+    return result;
 }
 
 static int dump_regs(pid_t pid, char *out_path) {
@@ -64,7 +95,11 @@ static int dump_regs(pid_t pid, char *out_path) {
     // 1. Saving registers to file save/regs.bin
     struct user_regs_struct regs;
 
-    ptrace(PTRACE_GETREGS, pid, NULL, &regs); // save regs
+    if (ptrace(PTRACE_GETREGS, pid, NULL, &regs) == -1) { // save regs
+        perror("Error: cannot read the registers of the target");
+        return ERROR;
+    }
+
     FILE *file_handle;
 
     file_handle = fopen("../save/regs.bin", "wb+");
@@ -74,13 +109,17 @@ static int dump_regs(pid_t pid, char *out_path) {
         return ERROR;
     }
 
-    if (fwrite(&regs, sizeof(struct user_regs_struct), 1, file_handle) ==
-        ERROR) {
-        perror("Write operation failure (save/regs.bin");
+    if (fwrite(&regs, sizeof(struct user_regs_struct), 1, file_handle) != 1) {
+        perror("Write operation failure (save/regs.bin)");
+        fclose(file_handle);
         return ERROR;
     }
 
-    fclose(file_handle); // close connection to save/regs.bin
+    // close connection to save/regs.bin
+    if (fclose(file_handle) != 0) {
+        perror("Error during closing the file (save/regs.bin)");
+        return ERROR;
+    }
     // -----------------------------------------------
     return OK;
 }
@@ -95,8 +134,12 @@ static int dump_exe_path(pid_t pid, char *out_path) {
                        sizeof(target_path) -
                            1); // read path from /proc/pid/exe symbolic link
 
-    if (len <= MIN_LEN_PATH) {
+    if (len < 0) {
         perror("Error: cannot read exe path");
+        return ERROR;
+    }
+    if (len <= MIN_LEN_PATH) {
+        fprintf(stderr, "Error: exe path of process %d is empty\n", pid);
         return ERROR;
     }
     target_path[len] = '\0';
@@ -109,36 +152,47 @@ static int dump_exe_path(pid_t pid, char *out_path) {
 
     if (fwrite(target_path, len, 1, file_handle) != 1) {
         perror("Write operation failure (save/exe.bin)");
+        fclose(file_handle);
         return ERROR;
     }
 
-    fclose(file_handle);
+    if (fclose(file_handle) != 0) {
+        perror("Error during closing the file (save/exe.bin)");
+        return ERROR;
+    }
     // --------------------------------------------------
     return OK;
 }
 
 static int dump_memory(pid_t pid, char *output_dir) {
+    int result = ERROR;
+    FILE *maps_file_handle = NULL;
+    FILE *mem_dump_file_handle = NULL;
+    int mem_file_handle = -1;
+
     char process_path[64];
     snprintf(process_path, sizeof(process_path), "/proc/%d/maps", pid);
-    FILE *file_handle = fopen(process_path, "r");
-    if (file_handle == NULL) {
+    maps_file_handle = fopen(process_path, "r");
+    if (maps_file_handle == NULL) {
         perror("Error during opening the virtual file (proc/pid/maps)");
-        return ERROR;
+        goto cleanup;
     }
 
     // ---------------------------
     // for read /proc/pid/mem
-    int mem_file_handle;
     char mem_process_path[PATH_MAX];
     snprintf(mem_process_path, sizeof(mem_process_path), "/proc/%d/mem", pid);
     mem_file_handle = open(mem_process_path, O_RDONLY); // open for reading only
+    if (mem_file_handle == -1) {
+        perror("Error during opening the virtual file (proc/pid/mem)");
+        goto cleanup;
+    }
     // ---------------------------
 
-    FILE *mem_dump_file_handle;
     mem_dump_file_handle = fopen("../save/mem.bin", "wb");
     if (mem_dump_file_handle == NULL) {
         perror("Error during opening the file (save/mem.bin)");
-        return ERROR;
+        goto cleanup;
     }
 
     char privileges[5];
@@ -158,7 +212,7 @@ static int dump_memory(pid_t pid, char *output_dir) {
     // 2. copy ares rw-p to file
     //
 
-    while (fgets(maps_line, sizeof(maps_line), file_handle) != NULL) {
+    while (fgets(maps_line, sizeof(maps_line), maps_file_handle) != NULL) {
 
         if (!parse_maps_line(maps_line, &seg, privileges, maps_path)) {
             fprintf(stderr, "Warning: unparsable maps line skipped: %s",
@@ -174,36 +228,81 @@ static int dump_memory(pid_t pid, char *output_dir) {
         if (!is_dumpable_path(maps_path))
             continue; // kernel owned pseudo mapping
 
-        save_to_mem_bin(mem_dump_file_handle, mem_file_handle, seg, buff);
+        if (save_to_mem_bin(mem_dump_file_handle, mem_file_handle, seg, buff) !=
+            OK) {
+            fprintf(stderr, "Error: failed on mapping %s", maps_line);
+            goto cleanup;
+        }
     }
 
-    close(mem_file_handle);
-    fclose(file_handle);
-    fclose(mem_dump_file_handle);
+    if (ferror(maps_file_handle)) {
+        perror("Read operation failure (proc/pid/maps)");
+        goto cleanup;
+    }
+
+    result = OK;
 
     // -----------------------------------------------
-    return OK;
+cleanup:
+    if (mem_file_handle != -1)
+        close(mem_file_handle);
+    if (maps_file_handle != NULL)
+        fclose(maps_file_handle);
+
+    if (mem_dump_file_handle != NULL && fclose(mem_dump_file_handle) != 0) {
+        perror("Error during closing the file (save/mem.bin)");
+        result = ERROR;
+    }
+
+    return result;
 }
 
 static int save_to_mem_bin(FILE *mem_dump_handle, int mem_vma_handle,
                            vma_segment_t seg, char buff[]) {
 
     // save start and end addresses in mem.bin
-    fwrite(&seg, sizeof(seg), 1, mem_dump_handle);
+    if (fwrite(&seg, sizeof(seg), 1, mem_dump_handle) != 1) {
+        perror("Write operation failure (save/mem.bin segment header)");
+        return ERROR;
+    }
+
     // open /proc/pid/mem folder
     // 1. copy exact amount of bytes from start segment
     unsigned long curr_send = 0;
-    unsigned long bytes_size = 4096;
 
     while (curr_send < seg.segment_size) {
-        if (curr_send + 4096 > seg.segment_size) {
-            bytes_size = seg.segment_size - curr_send;
+        unsigned long bytes_size = seg.segment_size - curr_send;
+        if (bytes_size > PAGE_SIZE)
+            bytes_size = PAGE_SIZE;
+
+        unsigned long curr_address = seg.start_segment_address + curr_send;
+        ssize_t bytes_read =
+            pread(mem_vma_handle, buff, bytes_size, curr_address);
+
+        if (bytes_read < 0) {
+            if (errno == EINTR)
+                continue; // interrupted before reading, just retry
+            fprintf(stderr,
+                    "Error: cannot read %lu bytes at 0x%lx from the target: "
+                    "%s\n",
+                    bytes_size, curr_address, strerror(errno));
+            return ERROR;
         }
-        pread(mem_vma_handle, buff, bytes_size,
-              seg.start_segment_address + curr_send);
+
+        if (bytes_read == 0) {
+            fprintf(stderr, "Error: unexpected end of memory at 0x%lx\n",
+                    curr_address);
+            return ERROR;
+        }
+
         // 2. write it into mem.bin
-        fwrite(buff, bytes_size, 1, mem_dump_handle);
-        curr_send += 4096;
+        if (fwrite(buff, 1, bytes_read, mem_dump_handle) !=
+            (size_t)bytes_read) {
+            perror("Write operation failure (save/mem.bin)");
+            return ERROR;
+        }
+
+        curr_send += bytes_read;
     }
     return OK;
 }

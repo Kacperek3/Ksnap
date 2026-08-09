@@ -5,7 +5,7 @@
 
 #include "config.h"
 
-// create snapshot of process
-void dump(ksnap_config_t);
+// create snapshot of process, returns OK or ERROR
+int dump(ksnap_config_t);
 
 #endif // DUMPER_H
