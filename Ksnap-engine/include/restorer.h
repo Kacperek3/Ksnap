@@ -5,6 +5,7 @@
 
 #include "config.h"
 
-void restorer(ksnap_config_t);
+// recreate a process from a snapshot, returns OK or ERROR
+int restorer(ksnap_config_t);
 
 #endif // !_RESTORER_H

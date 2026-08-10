@@ -18,7 +18,8 @@ int main(int argc, char **argv) {
         if (dump(config) != OK)
             return EXIT_FAILURE;
     } else if (!strcmp(config.mode, "RESTORE")) {
-        restorer(config);
+        if (restorer(config) != OK)
+            return EXIT_FAILURE;
     }
     return EXIT_SUCCESS;
 }

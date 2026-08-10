@@ -12,16 +12,14 @@
 #define MIN_LEN_PATH 0
 // ---------------------
 
+// fixed location until -d and -n are wired up
+#define KSNAP_SNAPSHOT_PATH "../save/snapshot.ksnap"
+
 typedef struct {
     char *mode;
     int pid;
     char *file_name;
     char *output_dir;
 } ksnap_config_t;
-
-typedef struct vma_segment_t {
-    unsigned long start_segment_address;
-    unsigned long segment_size;
-} vma_segment_t;
 
 #endif // !CONFIG_H

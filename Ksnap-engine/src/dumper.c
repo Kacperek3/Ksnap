@@ -8,32 +8,65 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <linux/limits.h>
 #include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h> // for PROT_* and MAP_*
 #include <unistd.h>
 
 #include "config.h"
+#include "dump_format.h"
 #include "dumper.h"
 #include <fcntl.h>
 
 #define MAPS_PATH_WIDTH "4095"
 _Static_assert(PATH_MAX == 4096, "MAPS_PATH_WIDTH must be PATH_MAX - 1");
 
+#define VMA_TABLE_INITIAL_CAPACITY 64
+#define PATH_POOL_INITIAL_CAPACITY 4096
+
+// one parsed line of /proc/pid/maps
+typedef struct {
+    unsigned long start;
+    unsigned long end;
+    unsigned long file_offset;
+    char privileges[5];
+    char path[PATH_MAX];
+} maps_line_t;
+
 // private main functions
-static int dump_regs(pid_t pid, char *out_path);
-static int dump_exe_path(pid_t pid, char *out_path);
-static int dump_memory(pid_t pid, char *out_path);
+static int read_regs(pid_t pid, struct user_regs_struct *regs);
+static int read_exe_path(pid_t pid, char exe_path[PATH_MAX],
+                         uint32_t *exe_path_len);
+static int collect_vmas(pid_t pid, vma_descriptor_t **out_vmas,
+                        uint32_t *out_count, char **out_pool,
+                        uint64_t *out_pool_size);
+static int write_snapshot(pid_t pid, const struct user_regs_struct *regs,
+                          const char *exe_path, uint32_t exe_path_len,
+                          vma_descriptor_t *vmas, uint32_t vma_count,
+                          const char *pool, uint64_t pool_size);
 //
-static int save_to_mem_bin(FILE *mem_dump_handle, int mem_vma_handle,
-                           vma_segment_t seg, char buff[]);
-static bool parse_maps_line(const char *maps_line, vma_segment_t *seg,
-                            char privileges[5], char maps_path[PATH_MAX]);
+static int write_vma_payload(FILE *snapshot_handle, int mem_vma_handle,
+                             const vma_descriptor_t *vma, char buff[]);
+static bool parse_maps_line(const char *maps_line, maps_line_t *parsed);
 static bool is_dumpable_path(const char *maps_path);
+static uint32_t perms_to_prot(const char privileges[5]);
+static uint32_t perms_to_map_flags(const char privileges[5]);
 
 int dump(ksnap_config_t config) {
     int status;
     int result = ERROR;
+
+    struct user_regs_struct regs;
+    char exe_path[PATH_MAX];
+    uint32_t exe_path_len = 0;
+    vma_descriptor_t *vmas = NULL;
+    uint32_t vma_count = 0;
+    char *path_pool = NULL;
+    uint64_t path_pool_size = 0;
 
     // attach process to our program
     if (ptrace(PTRACE_SEIZE, config.pid, NULL, NULL) == -1) {
@@ -60,8 +93,8 @@ int dump(ksnap_config_t config) {
     }
 
     //-----------------------------------------------------------------------------
-    // Info: right now all of the dumped bytes are located in .../save/ path
-    // (later the path will be specified) here the process is freezed
+    // Info: the whole snapshot goes into a single file (later the path will
+    // be specified) here the process is freezed
 
     // virtual folders important to dump
     // /proc/pid/mem        - physical memory areas
@@ -69,18 +102,27 @@ int dump(ksnap_config_t config) {
     // /proc/pid/exe        - path to executable program
 
     // 1.
-    if (dump_regs(config.pid, config.output_dir) != OK)
+    if (read_regs(config.pid, &regs) != OK)
         goto detach;
     // 2.
-    if (dump_exe_path(config.pid, config.output_dir) != OK)
+    if (read_exe_path(config.pid, exe_path, &exe_path_len) != OK)
         goto detach;
-    // 3.
-    if (dump_memory(config.pid, config.output_dir) != OK)
+    // 3. the whole table is collected before any memory is read, so the
+    // snapshot layout is known up front
+    if (collect_vmas(config.pid, &vmas, &vma_count, &path_pool,
+                     &path_pool_size) != OK)
+        goto detach;
+    // 4.
+    if (write_snapshot(config.pid, &regs, exe_path, exe_path_len, vmas,
+                       vma_count, path_pool, path_pool_size) != OK)
         goto detach;
 
     result = OK;
 
 detach:
+    free(vmas);
+    free(path_pool);
+
     // waking the process
     if (ptrace(PTRACE_DETACH, config.pid, NULL, NULL) == -1) {
         perror("Error: cannot detach from the target process");
@@ -90,49 +132,21 @@ detach:
     return result;
 }
 
-static int dump_regs(pid_t pid, char *out_path) {
-    //-----------------------------------------------
-    // 1. Saving registers to file save/regs.bin
-    struct user_regs_struct regs;
-
-    if (ptrace(PTRACE_GETREGS, pid, NULL, &regs) == -1) { // save regs
+static int read_regs(pid_t pid, struct user_regs_struct *regs) {
+    if (ptrace(PTRACE_GETREGS, pid, NULL, regs) == -1) {
         perror("Error: cannot read the registers of the target");
         return ERROR;
     }
-
-    FILE *file_handle;
-
-    file_handle = fopen("../save/regs.bin", "wb+");
-    if (file_handle == NULL) {
-        // handle it later
-        perror("Error during opening the file(save/regs.bin)");
-        return ERROR;
-    }
-
-    if (fwrite(&regs, sizeof(struct user_regs_struct), 1, file_handle) != 1) {
-        perror("Write operation failure (save/regs.bin)");
-        fclose(file_handle);
-        return ERROR;
-    }
-
-    // close connection to save/regs.bin
-    if (fclose(file_handle) != 0) {
-        perror("Error during closing the file (save/regs.bin)");
-        return ERROR;
-    }
-    // -----------------------------------------------
     return OK;
 }
 
-static int dump_exe_path(pid_t pid, char *out_path) {
-    //------------------------------------------------
-    // 2. Saving path to executable into save/exe.bin
+static int read_exe_path(pid_t pid, char exe_path[PATH_MAX],
+                         uint32_t *exe_path_len) {
     char process_path[64];
-    char target_path[PATH_MAX];
     snprintf(process_path, sizeof(process_path), "/proc/%d/exe", pid);
-    int len = readlink(process_path, target_path,
-                       sizeof(target_path) -
-                           1); // read path from /proc/pid/exe symbolic link
+
+    // read path from /proc/pid/exe symbolic link
+    ssize_t len = readlink(process_path, exe_path, PATH_MAX - 1);
 
     if (len < 0) {
         perror("Error: cannot read exe path");
@@ -142,33 +156,26 @@ static int dump_exe_path(pid_t pid, char *out_path) {
         fprintf(stderr, "Error: exe path of process %d is empty\n", pid);
         return ERROR;
     }
-    target_path[len] = '\0';
 
-    FILE *file_handle = fopen("../save/exe.bin", "wb+");
-    if (file_handle == NULL) {
-        perror("Error during opening the file (save/exe.bin)");
-        return ERROR;
-    }
-
-    if (fwrite(target_path, len, 1, file_handle) != 1) {
-        perror("Write operation failure (save/exe.bin)");
-        fclose(file_handle);
-        return ERROR;
-    }
-
-    if (fclose(file_handle) != 0) {
-        perror("Error during closing the file (save/exe.bin)");
-        return ERROR;
-    }
-    // --------------------------------------------------
+    exe_path[len] = '\0';
+    *exe_path_len = (uint32_t)len;
     return OK;
 }
 
-static int dump_memory(pid_t pid, char *output_dir) {
+static int collect_vmas(pid_t pid, vma_descriptor_t **out_vmas,
+                        uint32_t *out_count, char **out_pool,
+                        uint64_t *out_pool_size) {
     int result = ERROR;
     FILE *maps_file_handle = NULL;
-    FILE *mem_dump_file_handle = NULL;
-    int mem_file_handle = -1;
+    vma_descriptor_t *vmas = NULL;
+    char *pool = NULL;
+    uint32_t count = 0;
+    uint32_t capacity = 0;
+    uint64_t pool_size = 0;
+    uint64_t pool_capacity = 0;
+
+    char maps_line[PATH_MAX + 128];
+    maps_line_t parsed;
 
     char process_path[64];
     snprintf(process_path, sizeof(process_path), "/proc/%d/maps", pid);
@@ -177,6 +184,126 @@ static int dump_memory(pid_t pid, char *output_dir) {
         perror("Error during opening the virtual file (proc/pid/maps)");
         goto cleanup;
     }
+
+    //
+    // 1. need to analyse maps
+    // format is like this to parse
+    // 08048000-08049000 r-xp 00000000 03:00 8312       /opt/test
+    // 08049000-0804a000 rw-p 00001000 03:00 8312       /opt/test
+    // 08050000-08051000 rw-p 00000000 00:00 0
+    // the last field is optional - anonymous mappings carry no path
+    //
+    // 2. describe every area worth dumping
+    //
+
+    while (fgets(maps_line, sizeof(maps_line), maps_file_handle) != NULL) {
+
+        if (!parse_maps_line(maps_line, &parsed)) {
+            fprintf(stderr, "Warning: unparsable maps line skipped: %s",
+                    maps_line);
+            continue;
+        }
+
+        if (parsed.privileges[0] != 'r')
+            continue; // segment must be readable
+        if (parsed.privileges[3] != 'p')
+            continue; // segment memory must be private
+
+        if (!is_dumpable_path(parsed.path))
+            continue; // kernel owned pseudo mapping
+
+        if (count == capacity) {
+            uint32_t new_capacity =
+                (capacity == 0) ? VMA_TABLE_INITIAL_CAPACITY : capacity * 2;
+            vma_descriptor_t *grown =
+                realloc(vmas, (size_t)new_capacity * sizeof(*grown));
+            if (grown == NULL) {
+                perror("Error: out of memory for the vma table");
+                goto cleanup;
+            }
+            vmas = grown;
+            capacity = new_capacity;
+        }
+
+        uint64_t path_len = strlen(parsed.path);
+        uint64_t path_offset = 0;
+
+        if (path_len > 0) {
+            // paths are stored NUL terminated so a reader can use the pool
+            // in place instead of copying out of it
+            uint64_t needed = pool_size + path_len + 1;
+            if (needed > pool_capacity) {
+                uint64_t new_capacity = (pool_capacity == 0)
+                                            ? PATH_POOL_INITIAL_CAPACITY
+                                            : pool_capacity * 2;
+                while (new_capacity < needed)
+                    new_capacity *= 2;
+
+                char *grown = realloc(pool, new_capacity);
+                if (grown == NULL) {
+                    perror("Error: out of memory for the path pool");
+                    goto cleanup;
+                }
+                pool = grown;
+                pool_capacity = new_capacity;
+            }
+
+            path_offset = pool_size;
+            memcpy(pool + pool_size, parsed.path, path_len + 1);
+            pool_size += path_len + 1;
+        }
+
+        vma_descriptor_t *vma = &vmas[count];
+        vma->start_address = parsed.start;
+        vma->size = parsed.end - parsed.start;
+        vma->file_offset = parsed.file_offset;
+        vma->data_offset = 0; // assigned once the snapshot layout is known
+        vma->prot = perms_to_prot(parsed.privileges);
+        vma->map_flags = perms_to_map_flags(parsed.privileges);
+        vma->path_offset = (uint32_t)path_offset;
+        vma->path_len = (uint32_t)path_len;
+        count++;
+    }
+
+    if (ferror(maps_file_handle)) {
+        perror("Read operation failure (proc/pid/maps)");
+        goto cleanup;
+    }
+
+    if (count == 0) {
+        fprintf(stderr, "Error: no dumpable mapping found for process %d\n",
+                pid);
+        goto cleanup;
+    }
+
+    *out_vmas = vmas;
+    *out_count = count;
+    *out_pool = pool;
+    *out_pool_size = pool_size;
+    vmas = NULL; // ownership moved to the caller
+    pool = NULL;
+    result = OK;
+
+cleanup:
+    if (maps_file_handle != NULL)
+        fclose(maps_file_handle);
+    free(vmas);
+    free(pool);
+    return result;
+}
+
+static int write_snapshot(pid_t pid, const struct user_regs_struct *regs,
+                          const char *exe_path, uint32_t exe_path_len,
+                          vma_descriptor_t *vmas, uint32_t vma_count,
+                          const char *pool, uint64_t pool_size) {
+    int result = ERROR;
+    FILE *snapshot_handle = NULL;
+    int mem_file_handle = -1;
+
+    ksnap_dump_header_t header;
+    char buff[PAGE_SIZE]; // 4096
+    uint64_t payload_offset;
+    long position;
 
     // ---------------------------
     // for read /proc/pid/mem
@@ -189,93 +316,97 @@ static int dump_memory(pid_t pid, char *output_dir) {
     }
     // ---------------------------
 
-    mem_dump_file_handle = fopen("../save/mem.bin", "wb");
-    if (mem_dump_file_handle == NULL) {
-        perror("Error during opening the file (save/mem.bin)");
+    snapshot_handle = fopen(KSNAP_SNAPSHOT_PATH, "wb");
+    if (snapshot_handle == NULL) {
+        perror("Error during opening the snapshot file");
         goto cleanup;
     }
 
-    char privileges[5];
-    vma_segment_t seg;
-    char buff[PAGE_SIZE]; // 4096
-    char maps_line[PATH_MAX + 128];
-    char maps_path[PATH_MAX];
+    memset(&header, 0, sizeof(header));
+    memcpy(header.magic, KSNAP_MAGIC, KSNAP_MAGIC_LEN);
+    header.version = KSNAP_FORMAT_VERSION;
+    header.vma_count = vma_count;
+    header.vma_table_offset = sizeof(header);
+    header.path_pool_offset =
+        header.vma_table_offset + (uint64_t)vma_count * sizeof(*vmas);
+    header.path_pool_size = pool_size;
+    header.data_offset = header.path_pool_offset + pool_size;
+    header.exe_path_len = exe_path_len;
+    memcpy(header.exe_path, exe_path, exe_path_len);
+    header.regs = *regs;
 
-    //
-    // 1. need to analyse maps
-    // format is like this to parse
-    // 08048000-08049000 r-xp 00000000 03:00 8312       /opt/test
-    // 08049000-0804a000 rw-p 00001000 03:00 8312       /opt/test
-    // 08050000-08051000 rw-p 00000000 00:00 0
-    // the last field is optional - anonymous mappings carry no path
-    //
-    // 2. copy ares rw-p to file
-    //
+    // payloads are streamed in table order right after the pool
+    payload_offset = header.data_offset;
+    for (uint32_t i = 0; i < vma_count; i++) {
+        vmas[i].data_offset = payload_offset;
+        payload_offset += vmas[i].size;
+    }
 
-    while (fgets(maps_line, sizeof(maps_line), maps_file_handle) != NULL) {
+    if (fwrite(&header, sizeof(header), 1, snapshot_handle) != 1) {
+        perror("Write operation failure (snapshot header)");
+        goto cleanup;
+    }
 
-        if (!parse_maps_line(maps_line, &seg, privileges, maps_path)) {
-            fprintf(stderr, "Warning: unparsable maps line skipped: %s",
-                    maps_line);
-            continue;
-        }
+    if (fwrite(vmas, sizeof(*vmas), vma_count, snapshot_handle) != vma_count) {
+        perror("Write operation failure (snapshot vma table)");
+        goto cleanup;
+    }
 
-        if (privileges[0] != 'r')
-            continue; // segment must be readable
-        if (privileges[3] != 'p')
-            continue; // segment memory must be private
+    if (pool_size > 0 &&
+        fwrite(pool, 1, pool_size, snapshot_handle) != pool_size) {
+        perror("Write operation failure (snapshot path pool)");
+        goto cleanup;
+    }
 
-        if (!is_dumpable_path(maps_path))
-            continue; // kernel owned pseudo mapping
+    // the descriptors already promise where each payload lands, so the file
+    // position has to agree before a single byte of memory is written
+    position = ftell(snapshot_handle);
+    if (position < 0 || (uint64_t)position != header.data_offset) {
+        fprintf(stderr,
+                "Error: snapshot layout mismatch, at %ld but expected %" PRIu64
+                "\n",
+                position, header.data_offset);
+        goto cleanup;
+    }
 
-        if (save_to_mem_bin(mem_dump_file_handle, mem_file_handle, seg, buff) !=
-            OK) {
-            fprintf(stderr, "Error: failed on mapping %s", maps_line);
+    for (uint32_t i = 0; i < vma_count; i++) {
+        if (write_vma_payload(snapshot_handle, mem_file_handle, &vmas[i],
+                              buff) != OK) {
+            fprintf(stderr,
+                    "Error: failed on mapping 0x%" PRIx64 "-0x%" PRIx64 "\n",
+                    vmas[i].start_address,
+                    vmas[i].start_address + vmas[i].size);
             goto cleanup;
         }
     }
 
-    if (ferror(maps_file_handle)) {
-        perror("Read operation failure (proc/pid/maps)");
-        goto cleanup;
-    }
-
     result = OK;
 
-    // -----------------------------------------------
 cleanup:
     if (mem_file_handle != -1)
         close(mem_file_handle);
-    if (maps_file_handle != NULL)
-        fclose(maps_file_handle);
 
-    if (mem_dump_file_handle != NULL && fclose(mem_dump_file_handle) != 0) {
-        perror("Error during closing the file (save/mem.bin)");
+    // buffered payload data only reaches the disk on fclose, so a failure
+    // here still means an incomplete dump
+    if (snapshot_handle != NULL && fclose(snapshot_handle) != 0) {
+        perror("Error during closing the snapshot file");
         result = ERROR;
     }
 
     return result;
 }
 
-static int save_to_mem_bin(FILE *mem_dump_handle, int mem_vma_handle,
-                           vma_segment_t seg, char buff[]) {
+static int write_vma_payload(FILE *snapshot_handle, int mem_vma_handle,
+                             const vma_descriptor_t *vma, char buff[]) {
+    // copy exact amount of bytes from start segment
+    uint64_t curr_send = 0;
 
-    // save start and end addresses in mem.bin
-    if (fwrite(&seg, sizeof(seg), 1, mem_dump_handle) != 1) {
-        perror("Write operation failure (save/mem.bin segment header)");
-        return ERROR;
-    }
-
-    // open /proc/pid/mem folder
-    // 1. copy exact amount of bytes from start segment
-    unsigned long curr_send = 0;
-
-    while (curr_send < seg.segment_size) {
-        unsigned long bytes_size = seg.segment_size - curr_send;
+    while (curr_send < vma->size) {
+        uint64_t bytes_size = vma->size - curr_send;
         if (bytes_size > PAGE_SIZE)
             bytes_size = PAGE_SIZE;
 
-        unsigned long curr_address = seg.start_segment_address + curr_send;
+        uint64_t curr_address = vma->start_address + curr_send;
         ssize_t bytes_read =
             pread(mem_vma_handle, buff, bytes_size, curr_address);
 
@@ -283,22 +414,24 @@ static int save_to_mem_bin(FILE *mem_dump_handle, int mem_vma_handle,
             if (errno == EINTR)
                 continue; // interrupted before reading, just retry
             fprintf(stderr,
-                    "Error: cannot read %lu bytes at 0x%lx from the target: "
-                    "%s\n",
+                    "Error: cannot read %" PRIu64 " bytes at 0x%" PRIx64
+                    " from the target: %s\n",
                     bytes_size, curr_address, strerror(errno));
             return ERROR;
         }
 
+        // a mapping listed in maps must be fully readable, so a short read
+        // means the layout changed under us and the dump cannot be trusted
         if (bytes_read == 0) {
-            fprintf(stderr, "Error: unexpected end of memory at 0x%lx\n",
+            fprintf(stderr,
+                    "Error: unexpected end of memory at 0x%" PRIx64 "\n",
                     curr_address);
             return ERROR;
         }
 
-        // 2. write it into mem.bin
-        if (fwrite(buff, 1, bytes_read, mem_dump_handle) !=
+        if (fwrite(buff, 1, bytes_read, snapshot_handle) !=
             (size_t)bytes_read) {
-            perror("Write operation failure (save/mem.bin)");
+            perror("Write operation failure (snapshot payload)");
             return ERROR;
         }
 
@@ -307,29 +440,26 @@ static int save_to_mem_bin(FILE *mem_dump_handle, int mem_vma_handle,
     return OK;
 }
 
-static bool parse_maps_line(const char *maps_line, vma_segment_t *seg,
-                            char privileges[5], char maps_path[PATH_MAX]) {
-    unsigned long finish_segment_address;
-
-    privileges[0] = '\0';
-    maps_path[0] = '\0';
+static bool parse_maps_line(const char *maps_line, maps_line_t *parsed) {
+    parsed->privileges[0] = '\0';
+    parsed->path[0] = '\0';
+    parsed->file_offset = 0;
 
     int parsed_fields =
-        sscanf(maps_line, "%lx-%lx %4s %*s %*s %*s %" MAPS_PATH_WIDTH "s",
-               &seg->start_segment_address, &finish_segment_address, privileges,
-               maps_path);
+        sscanf(maps_line, "%lx-%lx %4s %lx %*s %*s %" MAPS_PATH_WIDTH "s",
+               &parsed->start, &parsed->end, parsed->privileges,
+               &parsed->file_offset, parsed->path);
 
-    // address range plus privileges are mandatory, the path is not
-    if (parsed_fields < 3)
+    // address range, privileges and offset are mandatory, the path is not
+    if (parsed_fields < 4)
         return false;
 
-    if (strlen(privileges) != 4)
+    if (strlen(parsed->privileges) != 4)
         return false;
 
-    if (finish_segment_address <= seg->start_segment_address)
+    if (parsed->end <= parsed->start)
         return false;
 
-    seg->segment_size = finish_segment_address - seg->start_segment_address;
     return true;
 }
 
@@ -339,4 +469,21 @@ static bool is_dumpable_path(const char *maps_path) {
 
     return strcmp(maps_path, "[heap]") == 0 ||
            strcmp(maps_path, "[stack]") == 0;
+}
+
+static uint32_t perms_to_prot(const char privileges[5]) {
+    uint32_t prot = PROT_NONE;
+
+    if (privileges[0] == 'r')
+        prot |= PROT_READ;
+    if (privileges[1] == 'w')
+        prot |= PROT_WRITE;
+    if (privileges[2] == 'x')
+        prot |= PROT_EXEC;
+
+    return prot;
+}
+
+static uint32_t perms_to_map_flags(const char privileges[5]) {
+    return privileges[3] == 'p' ? MAP_PRIVATE : MAP_SHARED;
 }
