@@ -15,7 +15,19 @@
 
 #define KSNAP_MAGIC "KSNAPDMP"
 #define KSNAP_MAGIC_LEN 8
-#define KSNAP_FORMAT_VERSION 1
+#define KSNAP_FORMAT_VERSION 2
+
+// room for [vvar] [vvar_vclock] and [vdso]
+#define KSNAP_MAX_KERNEL_MAPS 4
+#define KSNAP_KERNEL_MAP_NAME_LEN 32
+
+// kernel owned mapping
+// the content is useless to copy but the address has to be kept
+typedef struct {
+    uint64_t start_address;
+    uint64_t size;
+    char name[KSNAP_KERNEL_MAP_NAME_LEN]; // "[vdso]", "[vvar]", ...
+} kernel_map_t;
 
 typedef struct {
     char magic[KSNAP_MAGIC_LEN]; // KSNAP_MAGIC, not NUL terminated
@@ -27,6 +39,8 @@ typedef struct {
     uint64_t data_offset;
     uint32_t exe_path_len;
     char exe_path[PATH_MAX];
+    uint32_t kernel_map_count;
+    kernel_map_t kernel_maps[KSNAP_MAX_KERNEL_MAPS];
     struct user_regs_struct regs;
 } ksnap_dump_header_t;
 
