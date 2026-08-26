@@ -39,14 +39,16 @@ static int set_final_regs(pid_t pid, const struct user_regs_struct *regs);
 // ------
 
 int restorer(ksnap_config_t config) {
-    (void)config;
-
     int result = ERROR;
     ksnap_dump_header_t header;
     vma_descriptor_t *vmas = NULL;
+    char snapshot_path[PATH_MAX];
+
+    if (build_snapshot_path(&config, snapshot_path) != OK)
+        return ERROR;
 
     // read before the fork - the executable to run comes from the header
-    FILE *snapshot_handle = fopen(KSNAP_SNAPSHOT_PATH, "rb");
+    FILE *snapshot_handle = fopen(snapshot_path, "rb");
     if (snapshot_handle == NULL) {
         perror("Error during opening the snapshot file");
         return ERROR;

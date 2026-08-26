@@ -34,7 +34,8 @@ static int collect_vmas(pid_t pid, vma_descriptor_t **out_vmas,
                         uint32_t *out_count, char **out_pool,
                         uint64_t *out_pool_size, kernel_map_t *kernel_maps,
                         uint32_t *out_kernel_map_count);
-static int write_snapshot(pid_t pid, const struct user_regs_struct *regs,
+static int write_snapshot(pid_t pid, const char *snapshot_path,
+                          const struct user_regs_struct *regs,
                           const char *exe_path, uint32_t exe_path_len,
                           vma_descriptor_t *vmas, uint32_t vma_count,
                           const char *pool, uint64_t pool_size,
@@ -60,6 +61,12 @@ int dump(ksnap_config_t config) {
     uint64_t path_pool_size = 0;
     kernel_map_t kernel_maps[KSNAP_MAX_KERNEL_MAPS];
     uint32_t kernel_map_count = 0;
+    char snapshot_path[PATH_MAX];
+
+    // resolved before the target is touched, a bad path must not leave the
+    // process frozen for nothing
+    if (build_snapshot_path(&config, snapshot_path) != OK)
+        return ERROR;
 
     // attach process to our program
     if (ptrace(PTRACE_SEIZE, config.pid, NULL, NULL) == -1) {
@@ -106,9 +113,9 @@ int dump(ksnap_config_t config) {
                      &path_pool_size, kernel_maps, &kernel_map_count) != OK)
         goto detach;
     // 4.
-    if (write_snapshot(config.pid, &regs, exe_path, exe_path_len, vmas,
-                       vma_count, path_pool, path_pool_size, kernel_maps,
-                       kernel_map_count) != OK)
+    if (write_snapshot(config.pid, snapshot_path, &regs, exe_path,
+                       exe_path_len, vmas, vma_count, path_pool,
+                       path_pool_size, kernel_maps, kernel_map_count) != OK)
         goto detach;
 
     result = OK;
@@ -316,7 +323,8 @@ cleanup:
     return result;
 }
 
-static int write_snapshot(pid_t pid, const struct user_regs_struct *regs,
+static int write_snapshot(pid_t pid, const char *snapshot_path,
+                          const struct user_regs_struct *regs,
                           const char *exe_path, uint32_t exe_path_len,
                           vma_descriptor_t *vmas, uint32_t vma_count,
                           const char *pool, uint64_t pool_size,
@@ -342,7 +350,7 @@ static int write_snapshot(pid_t pid, const struct user_regs_struct *regs,
     }
     // ---------------------------
 
-    snapshot_handle = fopen(KSNAP_SNAPSHOT_PATH, "wb");
+    snapshot_handle = fopen(snapshot_path, "wb");
     if (snapshot_handle == NULL) {
         perror("Error during opening the snapshot file");
         goto cleanup;
