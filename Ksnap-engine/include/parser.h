@@ -53,6 +53,12 @@ static inline void set_config_mode(ksnap_config_t *config, modes_t mode);
 static inline ksnap_status_t validate_pid(char *arg);
 static inline void set_config_pid(ksnap_config_t *config, int pid);
 
+static inline ksnap_status_t validate_name(char *arg);
+static inline void set_config_file_name(ksnap_config_t *config, char *name);
+
+static inline ksnap_status_t validate_dir(char *arg);
+static inline void set_config_output_dir(ksnap_config_t *config, char *dir);
+
 static inline ksnap_status_t validate_mandatory_args(ksnap_config_t *config);
 
 static inline bool check_status(ksnap_status_t *status);
@@ -70,7 +76,7 @@ static inline ksnap_status_t parse_arg(int argc, char **argv,
     modes_t mode;
     ksnap_status_t status = KSNAP_ERR_MISSING_ARGS;
 
-    while ((opt = getopt(argc, argv, "m:p:hn")) != -1) {
+    while ((opt = getopt(argc, argv, "m:p:n:d:h")) != -1) {
         switch (opt) {
         case 'm':
             status = validate_mode(optarg, &mode);
@@ -107,11 +113,31 @@ static inline ksnap_status_t parse_arg(int argc, char **argv,
             printf("Example:\n");
             printf("  sudo ./Ksnap -m Dump -p 1234 -n memory_dump -d "
                    "/tmp/ksnap\n");
-            break;
+            // nothing else makes sense after the usage was asked for
+            exit(EXIT_SUCCESS);
 
         case 'n':
-            printf("n flag added\n");
+            status = validate_name(optarg);
+
+            if (status != KSNAP_OK)
+                return status;
+
+            set_config_file_name(config, optarg);
+
             break;
+
+        case 'd':
+            status = validate_dir(optarg);
+
+            if (status != KSNAP_OK)
+                return status;
+
+            set_config_output_dir(config, optarg);
+
+            break;
+
+        default:
+            return KSNAP_ERR_INVALID_ARGS;
         }
     }
 
@@ -154,6 +180,42 @@ static inline ksnap_status_t validate_pid(char *arg) {
 }
 static inline void set_config_pid(ksnap_config_t *config, int pid) {
     config->pid = pid;
+}
+
+// the name has to stay a single file inside the given directory, a path
+// separator here would silently write the snapshot somewhere else
+static inline ksnap_status_t validate_name(char *arg) {
+    size_t size = strlen(arg);
+
+    if (size == 0 || size > NAME_MAX)
+        return KSNAP_ERR_INVALID_NAME;
+
+    if (strchr(arg, '/') != NULL)
+        return KSNAP_ERR_INVALID_NAME;
+
+    if (!strcmp(arg, ".") || !strcmp(arg, ".."))
+        return KSNAP_ERR_INVALID_NAME;
+
+    return KSNAP_OK;
+}
+
+static inline void set_config_file_name(ksnap_config_t *config, char *name) {
+    // argv lives as long as the program so the pointer can be kept as is
+    config->file_name = name;
+}
+
+// room is left for a separator and the shortest possible file name
+static inline ksnap_status_t validate_dir(char *arg) {
+    size_t size = strlen(arg);
+
+    if (size <= MIN_LEN_PATH || size > PATH_MAX - NAME_MAX - 2)
+        return KSNAP_ERR_INVALID_ARGS;
+
+    return KSNAP_OK;
+}
+
+static inline void set_config_output_dir(ksnap_config_t *config, char *dir) {
+    config->output_dir = dir;
 }
 
 static inline ksnap_status_t validate_mandatory_args(ksnap_config_t *config) {
