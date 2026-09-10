@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en" data-bs-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Ksnap - checkpoint/restore panel</title>
+    <link rel="stylesheet" href="/static/vendor/bootstrap.min.css" />
+    <link rel="stylesheet" href="/static/css/app.css" />
+  </head>
+  <body>
+    <nav class="navbar navbar-expand bg-body-tertiary border-bottom">
+      <div class="container-fluid">
+        <span class="navbar-brand mb-0 h1">
+          Ksnap<span class="text-secondary fw-normal fs-6 ms-2">checkpoint / restore</span>
+        </span>
+        <div class="d-flex gap-2">
+          <span class="badge text-bg-secondary" id="pill-engine">engine …</span>
+          <span class="badge text-bg-secondary" id="pill-privileges">privileges …</span>
+          <span class="badge text-bg-secondary" id="pill-restore">idle</span>
+        </div>
+      </div>
+    </nav>
+
+    <main class="container-fluid py-3">
+      <div id="alerts"></div>
+
+      <div class="row g-3">
+        <section class="col-xl-7">
+          <div class="card h-100">
+            <div class="card-header d-flex align-items-center gap-2">
+              <span class="fw-semibold">Processes</span>
+              <input
+                type="search"
+                id="process-filter"
+                class="form-control form-control-sm ms-auto w-auto"
+                placeholder="filter by pid, name or command"
+                autocomplete="off"
+              />
+              <button class="btn btn-sm btn-outline-secondary" id="btn-refresh-processes">
+                Refresh
+              </button>
+              <button class="btn btn-sm btn-primary" id="btn-dump" disabled>
+                Create snapshot
+              </button>
+            </div>
+            <div class="card-body p-0 table-scroll">
+              <table class="table table-sm table-hover align-middle mb-0">
+                <thead class="sticky-top">
+                  <tr>
+                    <th style="width: 2rem"></th>
+                    <th>PID</th>
+                    <th>Name</th>
+                    <th>User</th>
+                    <th class="text-end">Threads</th>
+                    <th class="text-end">RSS</th>
+                    <th>State</th>
+                  </tr>
+                </thead>
+                <tbody id="process-rows">
+                  <tr><td colspan="7" class="text-secondary p-3">Loading…</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="card-footer text-secondary small" id="process-summary"></div>
+          </div>
+        </section>
+
+        <section class="col-xl-5">
+          <div class="card h-100">
+            <div class="card-header d-flex align-items-center">
+              <span class="fw-semibold">Snapshots</span>
+              <button
+                class="btn btn-sm btn-outline-secondary ms-auto"
+                id="btn-refresh-snapshots"
+              >
+                Refresh
+              </button>
+            </div>
+            <div class="card-body p-0 table-scroll">
+              <table class="table table-sm align-middle mb-0">
+                <thead class="sticky-top">
+                  <tr>
+                    <th>Name</th>
+                    <th>Executable</th>
+                    <th class="text-end">VMAs</th>
+                    <th class="text-end">Size</th>
+                    <th class="text-end">Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="snapshot-rows">
+                  <tr><td colspan="5" class="text-secondary p-3">Loading…</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="card-footer d-flex align-items-center gap-2 small">
+              <span class="text-secondary" id="snapshot-dir"></span>
+              <button class="btn btn-sm btn-danger ms-auto d-none" id="btn-stop">
+                Stop restored process
+              </button>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <section class="card mt-3">
+        <div class="card-header d-flex align-items-center gap-3">
+          <span class="fw-semibold">Console</span>
+          <span class="text-secondary small">
+            engine diagnostics and the output of the restored process
+          </span>
+          <div class="form-check form-switch ms-auto mb-0">
+            <input class="form-check-input" type="checkbox" id="autoscroll" checked />
+            <label class="form-check-label small" for="autoscroll">Auto-scroll</label>
+          </div>
+          <button class="btn btn-sm btn-outline-secondary" id="btn-clear-logs">Clear</button>
+        </div>
+        <div class="card-body p-0">
+          <div id="console" class="console"></div>
+        </div>
+      </section>
+    </main>
+
+    <div class="modal fade" id="dump-modal" tabindex="-1">
+      <div class="modal-dialog">
+        <form class="modal-content" id="dump-form">
+          <div class="modal-header">
+            <h5 class="modal-title">Create snapshot</h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+          </div>
+          <div class="modal-body">
+            <p class="text-secondary small mb-3" id="dump-target"></p>
+            <label class="form-label" for="dump-name">Snapshot name</label>
+            <input
+              class="form-control"
+              id="dump-name"
+              pattern="[A-Za-z0-9._-]{1,64}"
+              required
+            />
+            <div class="form-text">
+              Letters, digits, dot, dash and underscore. The engine is invoked as
+              <code>-d &lt;snapshot dir&gt; -n &lt;name&gt;</code>.
+            </div>
+            <div class="alert alert-warning mt-3 mb-0 py-2 small d-none" id="dump-warning">
+              This process has more than one thread. The engine restores
+              single-threaded processes only, so the snapshot may not come back.
+            </div>
+          </div>
+          <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">
+              Cancel
+            </button>
+            <button type="submit" class="btn btn-primary" id="dump-submit">Snapshot</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <script src="/static/vendor/bootstrap.bundle.min.js"></script>
+    <script src="/static/js/app.js"></script>
+  </body>
+</html>

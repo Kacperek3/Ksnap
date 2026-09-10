@@ -1,4 +1,4 @@
-# Ksnap web panel — intermediate layer and GUI
+# Ksnap web panel: intermediate layer and GUI
 
 The panel is the third tier of Ksnap: a Flask REST API that drives the C engine
 (`Ksnap-engine/build/Ksnap`) and a static browser frontend that talks only to
@@ -17,8 +17,8 @@ Ksnap engine (C, ptrace + /proc)
 * Python 3 with Flask (`python3 -c "import flask"` must succeed)
 * the engine built: `cd Ksnap-engine && make`
 
-No other dependency — the API reads `/proc` and parses the snapshot header with
-the standard library only.
+There are no other dependencies; the API reads `/proc` and parses the snapshot
+header with the standard library only.
 
 ## Running
 
@@ -27,8 +27,8 @@ The engine needs root (`ptrace`, `/proc/<pid>/mem`). Two supported modes:
 **1. Unprivileged API + `sudo -n` (default).** Allow the engine without a
 password by creating `/etc/sudoers.d/ksnap` (`sudo visudo -f /etc/sudoers.d/ksnap`):
 
-The second line is only needed for the *Stop restored process* button — the
-restored process runs as root, so it cannot be signalled by an ordinary user.
+The second line is only needed for the *Stop restored process* button, because
+the restored process runs as root and cannot be signalled by an ordinary user.
 Then:
 
 ```
@@ -81,8 +81,8 @@ list, never through a shell.
 `Ksnap -m Restore` waits for the process it brought back (`waitpid` in
 `src/restorer.c`), so the API keeps it as a *session*: its merged stdout/stderr
 is the restored program's own output and is streamed into the console. Only one
-session can run at a time — restores replay fixed addresses, so two would
-collide.
+session can run at a time, because restores replay fixed addresses and two
+would collide.
 
 ## Tests
 
@@ -92,6 +92,6 @@ python3 -m unittest discover -s Ksnap-web/Ksnap-backend/tests -t Ksnap-web/Ksnap
 
 ## Known limitations (MVP scope of the engine)
 
-* single-threaded processes only — multi-threaded ones are listed with a warning
+* single-threaded processes only; multi-threaded ones are listed with a warning
 * open file descriptors, process trees and sockets are not restored
 * a restored process is started from the snapshot's own executable path
