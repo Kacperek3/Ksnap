@@ -13,3 +13,17 @@ Ksnap-engine/compile_commands.json
 
 Ksnap-engine/save/
 Ksnap-engine/.cache/
+
+# test output (dump + restore logs)
+Ksnap-engine/test/*.txt
+
+# built by 'make test_programs', unlike the counter binaries which are
+# committed because the restore test depends on their exact layout
+Ksnap-engine/test_programs/threads
+
+# skip all executable files
+*.elf
+
+# python bytecode of the web layer
+__pycache__/
+*.pyc
