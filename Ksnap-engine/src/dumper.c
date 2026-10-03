@@ -106,13 +106,13 @@ int dump(ksnap_config_t config) {
         goto detach;
     // 3. the whole table is collected before any memory is read, so the
     // snapshot layout is known up front
-    if (collect_vmas(config.pid, &vmas, &vma_count, &path_pool,
-                     &path_pool_size, kernel_maps, &kernel_map_count) != OK)
+    if (collect_vmas(config.pid, &vmas, &vma_count, &path_pool, &path_pool_size,
+                     kernel_maps, &kernel_map_count) != OK)
         goto detach;
     // 4.
-    if (write_snapshot(config.pid, snapshot_path, &regs, exe_path,
-                       exe_path_len, vmas, vma_count, path_pool,
-                       path_pool_size, kernel_maps, kernel_map_count) != OK)
+    if (write_snapshot(config.pid, snapshot_path, &regs, exe_path, exe_path_len,
+                       vmas, vma_count, path_pool, path_pool_size, kernel_maps,
+                       kernel_map_count) != OK)
         goto detach;
 
     result = OK;
@@ -470,4 +470,3 @@ static int write_vma_payload(FILE *snapshot_handle, int mem_vma_handle,
     }
     return OK;
 }
-

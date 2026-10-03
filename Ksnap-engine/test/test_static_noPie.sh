@@ -62,6 +62,8 @@ echo "Starting tests"
 [ -x "$KSNAP" ] || fail "$KSNAP not found, run 'make' first"
 [ -x "$PROGRAM" ] || fail "$PROGRAM not found"
 
+mkdir -p "$ENGINE_DIR/save" || fail "cannot create $ENGINE_DIR/save"
+
 sudo -v || fail "sudo authentication failed"
 
 : >"$DUMP_LOG"

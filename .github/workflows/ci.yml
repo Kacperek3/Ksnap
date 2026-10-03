@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [devel, main]
+  pull_request:
+    branches: [main]
+
+# a push that lands while the previous run is still going makes that run pointless
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  engine:
+    name: engine (build, dump and restore)
+    # x86-64 on purpose: the restorer patches rax/rdi/rsi by hand and the test
+    # program is a static non-PIE x86-64 binary committed to the repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build, warnings are errors
+        working-directory: Ksnap-engine
+        run: make CFLAGS="-g -Wall -Werror -Iinclude"
+
+      # the threads helper is generated, unlike the committed counter binaries
+      - name: Build the test helpers
+        working-directory: Ksnap-engine
+        run: make test_programs
+
+      # lets test_check.sh exercise its already_traced case instead of skipping it
+      - name: Install strace
+        run: sudo apt-get update && sudo apt-get install -y strace
+
+      - name: Dump and restore a live process
+        working-directory: Ksnap-engine
+        run: test/test_static_noPie.sh
+
+      - name: Check mode and the snapshot_bytes invariant
+        working-directory: Ksnap-engine
+        run: test/test_check.sh
+
+      - name: Keep the engine logs when something fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: engine-logs
+          path: Ksnap-engine/test/*.txt
+          if-no-files-found: ignore
+
+  panel:
+    name: panel (python ${{ matrix.python }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - run: pip install -r Ksnap-web/Ksnap-backend/requirements.txt
+
+      - name: Unit tests
+        run: >
+          python3 -m unittest discover --verbose
+          -s Ksnap-web/Ksnap-backend/tests
+          -t Ksnap-web/Ksnap-backend/tests
+
+  static:
+    name: static checks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - run: pip install clang-format==22.1.8
+
+      - name: C formatting
+        run: >
+          clang-format --dry-run --Werror
+          Ksnap-engine/src/*.c Ksnap-engine/include/*.h
+
+      - name: Frontend syntax
+        run: node --check Ksnap-web/Ksnap-frontend/src/js/app.js
