@@ -30,6 +30,11 @@ jobs:
         working-directory: Ksnap-engine
         run: make test_programs
 
+      # needs no root, and it is the fast deterministic one, so it runs first
+      - name: Refuse a damaged snapshot
+        working-directory: Ksnap-engine
+        run: test/test_restore_validation.sh
+
       # lets test_check.sh exercise its already_traced case instead of skipping it
       - name: Install strace
         run: sudo apt-get update && sudo apt-get install -y strace

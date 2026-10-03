@@ -8,6 +8,7 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <linux/limits.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -127,14 +128,36 @@ int restorer(ksnap_config_t config) {
                     close(mem_new_process_file_handle);
                 }
 
-                if (set_final_regs(new_process, &header.regs) != OK)
+                if (result == OK &&
+                    set_final_regs(new_process, &header.regs) != OK)
                     result = ERROR;
 
-                ptrace(PTRACE_DETACH, new_process, NULL, NULL);
-                waitpid(new_process, &status, 0);
+                if (result == OK) {
+                    ptrace(PTRACE_DETACH, new_process, NULL, NULL);
+                    waitpid(new_process, &status, 0);
+                } else {
+                    // a half restored process must never be released. It would
+                    // run with the registers of the snapshot over whatever
+                    // memory happened to make it in, and under sudo it would do
+                    // that as root.
+                    fprintf(stderr,
+                            "Error: restore failed, killing the half restored "
+                            "process %d\n",
+                            new_process);
+                    kill(new_process, SIGKILL);
+                    waitpid(new_process, &status, 0);
+                }
             } else {
                 fprintf(stderr, "Error: the new process did not stop for the "
                                 "restore\n");
+
+                // it holds nothing of the snapshot yet, but it may still be
+                // running. A process that already exited was reaped by the
+                // waitpid above and its pid must not be signalled again.
+                if (!WIFEXITED(status) && !WIFSIGNALED(status)) {
+                    kill(new_process, SIGKILL);
+                    waitpid(new_process, &status, 0);
+                }
             }
         }
 
@@ -170,6 +193,29 @@ static int read_snapshot_metadata(FILE *snapshot_handle,
         fprintf(stderr, "Error: snapshot describes no mapping\n");
         return ERROR;
     }
+
+    // kernel_maps is a fixed array, so a count out of a damaged or hostile file
+    // would send the two loops in restore_kernel_maps straight past its end
+    if (header->kernel_map_count > KSNAP_MAX_KERNEL_MAPS) {
+        fprintf(stderr,
+                "Error: snapshot claims %u kernel mappings, the format holds "
+                "at most %d\n",
+                header->kernel_map_count, KSNAP_MAX_KERNEL_MAPS);
+        return ERROR;
+    }
+
+    // the header is read raw from the file, so the executable path is only as
+    // terminated as the file says. The length is recorded, so use it instead of
+    // trusting the bytes.
+    if (header->exe_path_len == 0 ||
+        header->exe_path_len >= sizeof(header->exe_path)) {
+        fprintf(stderr,
+                "Error: snapshot has an impossible executable path "
+                "length of %u\n",
+                header->exe_path_len);
+        return ERROR;
+    }
+    header->exe_path[header->exe_path_len] = '\0';
 
     // a damaged file must not turn into a huge allocation
     if (fstat(fileno(snapshot_handle), &snapshot_stat) != 0) {
@@ -442,8 +488,8 @@ static int restore_kernel_maps(pid_t pid, const ksnap_dump_header_t *header) {
 }
 
 static int spawn_traced_child(const char *exe_path) {
-    // the path comes straight out of the snapshot header which is already
-    // NUL terminated so  it only has to be copied into a writable argv
+    // read_snapshot_metadata terminated the path using the length from the
+    // header, so here it only has to be copied into a writable argv
     char argv0[PATH_MAX];
     snprintf(argv0, sizeof(argv0), "%s", exe_path);
 
