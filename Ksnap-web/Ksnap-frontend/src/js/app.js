@@ -11,9 +11,19 @@ const POLL_INTERVAL_MS = 1000;
 
 const state = {
   processes: [],
+  counts: { ok: 0, risky: 0, blocked: 0 },
+  kernelThreads: 0,
   selectedPid: null,
   logCursor: 0,
   restoreRunning: false,
+};
+
+// how a verdict from the backend is shown in the Status column
+const LEVELS = {
+  ok: { label: "restorable", className: "text-bg-success" },
+  risky: { label: "partial", className: "text-bg-warning" },
+  blocked: { label: "not restorable", className: "text-bg-danger" },
+  unknown: { label: "not checked", className: "text-bg-secondary" },
 };
 
 const dumpModal = new bootstrap.Modal("#dump-modal");
@@ -59,6 +69,16 @@ function cell(row, text, className) {
   const td = row.insertCell();
   if (className) td.className = className;
   td.textContent = text;
+  return td;
+}
+
+function badge(row, level, reasons) {
+  const td = row.insertCell();
+  const span = document.createElement("span");
+  span.className = `badge ${LEVELS[level].className}`;
+  span.textContent = reasons.length ? reasons[0].code.replace(/_/g, " ") : LEVELS[level].label;
+  td.title = reasons.map((reason) => reason.message).join("\n") || "the engine handles this process";
+  td.appendChild(span);
   return td;
 }
 
@@ -112,8 +132,8 @@ async function refreshStatus() {
 function renderProcesses(processes) {
   const tbody = element("process-rows");
   if (!processes.length) {
-    placeholder(tbody, 7, "No matching process.");
-    element("process-summary").textContent = "";
+    placeholder(tbody, 8, "No process the engine can restore. Tick 'Show all' to see why.");
+    renderProcessSummary();
     return;
   }
 
@@ -122,48 +142,67 @@ function renderProcesses(processes) {
     const row = tbody.insertRow();
     row.dataset.pid = String(process.pid);
 
+    const level = process.eligibility.level;
+    const blocked = level === "blocked" || level === "unknown";
+    if (blocked) row.className = "opacity-50";
+
     const radio = document.createElement("input");
     radio.type = "radio";
     radio.name = "process";
     radio.className = "form-check-input";
     radio.checked = process.pid === state.selectedPid;
+    radio.disabled = blocked;
     radio.addEventListener("change", () => selectProcess(process.pid));
     row.insertCell().appendChild(radio);
-    row.addEventListener("click", () => {
-      radio.checked = true;
-      selectProcess(process.pid);
-    });
+    if (!blocked) {
+      row.addEventListener("click", () => {
+        radio.checked = true;
+        selectProcess(process.pid);
+      });
+    }
 
     cell(row, process.pid, "font-monospace");
     const name = cell(row, process.name);
     name.title = process.cmdline;
     cell(row, process.user);
 
-    const threads = cell(row, process.threads, "text-end");
-    if (!process.supported) {
-      threads.classList.add("text-warning");
-      threads.title = "the engine restores single-threaded processes only";
-    }
-
+    cell(row, process.threads, "text-end");
+    badge(row, level, process.eligibility.reasons);
     cell(row, formatSize(process.rss_kb * 1024), "text-end");
     cell(row, process.state, "text-secondary");
   }
 
-  element("process-summary").textContent = `${processes.length} process(es), ${
-    processes.filter((process) => process.supported).length
-  } single-threaded`;
+  renderProcessSummary();
+}
+
+function renderProcessSummary() {
+  const { ok, risky, blocked, unknown } = state.counts;
+  const skipped = state.kernelThreads
+    ? `, ${state.kernelThreads} kernel thread(s) skipped`
+    : "";
+  const unchecked = unknown ? `, ${unknown} not checked` : "";
+  element("process-summary").textContent =
+    `${ok} restorable, ${risky} partial, ${blocked} not restorable` +
+    `${unchecked}${skipped}`;
 }
 
 function selectProcess(pid) {
-  state.selectedPid = pid;
-  element("btn-dump").disabled = false;
+  const process = state.processes.find((item) => item.pid === pid);
+  state.selectedPid = process ? pid : null;
+  const level = process ? process.eligibility.level : "unknown";
+  element("btn-dump").disabled = level === "blocked" || level === "unknown";
 }
 
 async function refreshProcesses() {
   try {
     const query = element("process-filter").value.trim();
-    const payload = await api(`/api/processes?query=${encodeURIComponent(query)}`);
+    const all = element("process-show-all").checked ? "1" : "";
+    const payload = await api(
+      `/api/processes?query=${encodeURIComponent(query)}&all=${all}`,
+    );
     state.processes = payload.processes;
+    state.counts = payload.counts;
+    state.kernelThreads = payload.kernel_threads;
     if (!state.processes.some((process) => process.pid === state.selectedPid)) {
       state.selectedPid = null;
       element("btn-dump").disabled = true;
@@ -261,12 +300,25 @@ function openDumpModal() {
   const process = state.processes.find((item) => item.pid === state.selectedPid);
   if (!process) return;
 
-  element("dump-target").textContent = `${process.name} (pid ${process.pid}): ${process.cmdline}`;
+  const bytes = (process.eligibility.facts || {}).snapshot_bytes;
+  const size = bytes ? ` | snapshot about ${formatSize(bytes)}` : "";
+  element("dump-target").textContent =
+    `${process.name} (pid ${process.pid}): ${process.cmdline}${size}`;
   element("dump-name").value = `${process.name}-${process.pid}`.replace(
     /[^A-Za-z0-9._-]/g,
     "-",
   );
-  element("dump-warning").classList.toggle("d-none", process.supported);
+  const caveats = process.eligibility.reasons.filter(
+    (reason) => reason.level === "risky",
+  );
+  const list = element("dump-warning-list");
+  list.innerHTML = "";
+  for (const caveat of caveats) {
+    const item = document.createElement("li");
+    item.textContent = caveat.message;
+    list.appendChild(item);
+  }
+  element("dump-warning").classList.toggle("d-none", caveats.length === 0);
   dumpModal.show();
 }
 
@@ -360,6 +412,8 @@ function bind() {
       showError(error);
     }
   });
+
+  element("process-show-all").addEventListener("change", refreshProcesses);
 
   let filterTimer;
   element("process-filter").addEventListener("input", () => {

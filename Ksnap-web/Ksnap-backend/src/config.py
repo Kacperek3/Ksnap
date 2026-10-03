@@ -41,6 +41,15 @@ PORT = int(os.environ.get("KSNAP_PORT", "5000"))
 
 LOG_CAPACITY = int(os.environ.get("KSNAP_LOG_CAPACITY", "2000"))
 
+# 'Ksnap -m Check' reports on every process in /proc in one go, so this is a
+# whole listing rather than a single process
+CHECK_TIMEOUT_SECONDS = float(os.environ.get("KSNAP_CHECK_TIMEOUT", "15"))
+
+# the engine tells the panel exactly how many payload bytes a snapshot would
+# hold, and above this the panel calls it out. A big snapshot is a warning, not
+# a refusal, which is why the threshold lives here and not in the engine.
+MAX_SNAPSHOT_MB = int(os.environ.get("KSNAP_MAX_SNAPSHOT_MB", "512"))
+
 
 def uses_sudo():
     """Answer whether engine calls have to be wrapped in 'sudo -n'."""

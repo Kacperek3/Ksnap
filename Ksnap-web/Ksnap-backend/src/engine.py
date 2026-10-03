@@ -6,6 +6,7 @@ in src/restorer.c), so it is tracked as a session whose output is streamed into
 the logbook - that output is the restored program's own stdout.
 """
 
+import json
 import os
 import signal
 import subprocess
@@ -48,6 +49,27 @@ def _snapshot_dir():
     return str(directory)
 
 
+# what the engine prints on stderr, translated into something the panel can
+# show. The raw output stays in the console either way.
+_FAILURES = (
+    ("no dumpable mapping found", "the process has no memory the engine can "
+                                 "copy, it may have exited mid dump"),
+    ("exe path is empty", "the executable of the process cannot be resolved, "
+                          "kernel threads cannot be snapshotted"),
+    ("unexpected end of memory", "the memory of the process changed or became "
+                                 "unreadable while it was being copied"),
+    ("kernel mismatch", "the snapshot was taken on a different kernel, its "
+                        "vdso no longer fits"),
+    ("has no [vdso]", "the restored process lacks a mapping the snapshot "
+                      "needs, dump and restore must run on the same kernel"),
+    ("two step move would be needed", "the vdso of the new process overlaps "
+                                      "the address the snapshot needs"),
+    ("Operation not permitted", "ptrace was refused, the engine needs root "
+                                "and the process must not be traced already"),
+    ("No such process", "the process exited before the engine could attach"),
+)
+
+
 def _explain_failure(returncode, output):
     if config.uses_sudo() and "password is required" in output:
         return (
@@ -55,7 +77,69 @@ def _explain_failure(returncode, output):
             "(see Ksnap-backend/docs/README.md) or run the API as root with "
             "KSNAP_SUDO=0."
         )
+    for marker, explanation in _FAILURES:
+        if marker in output:
+            return explanation
     return "engine exited with code %d" % returncode
+
+
+# 'Ksnap -m Check' answers with this when the process is simply not a usable
+# target, which is an answer and not a failure of the tool
+CHECK_EXIT_BLOCKED = 11
+
+
+def check(pid=None):
+    """What the engine says about *pid*, or about every process when None.
+
+    Returns {pid: report}, where a report is one JSON object as documented in
+    Ksnap-engine/docs/markdown/check_mode.md. The engine is the authority on
+    what it can dump, so the panel asks instead of reimplementing the rules.
+    """
+    argv = [_binary(), "-m", "Check"]
+    if pid is not None:
+        argv += ["-p", str(pid)]
+
+    try:
+        completed = subprocess.run(
+            _command(argv),
+            capture_output=True,
+            text=True,
+            timeout=config.CHECK_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        raise EngineError(
+            "the eligibility check timed out after %.0fs"
+            % config.CHECK_TIMEOUT_SECONDS
+        )
+    except OSError as error:
+        raise EngineError("cannot start the engine: %s" % error)
+
+    if completed.returncode not in (0, CHECK_EXIT_BLOCKED):
+        message = _explain_failure(completed.returncode, completed.stderr.strip())
+        logbook.append(
+            "Eligibility check failed: %s" % message,
+            level=logbook_module.ERROR,
+            source="check",
+        )
+        raise EngineError(message)
+
+    reports = {}
+    for line in completed.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            report = json.loads(line)
+            reports[int(report["pid"])] = report
+        except (ValueError, KeyError, TypeError):
+            # one unreadable line must not cost the whole listing
+            logbook.append(
+                "unreadable check output: %s" % line[:120],
+                level=logbook_module.ERROR,
+                source="check",
+            )
+
+    return reports
 
 
 def dump(pid, name):

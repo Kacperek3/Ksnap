@@ -6,6 +6,7 @@ Run it with:   python3 src/app.py
 from flask import Flask, jsonify, request, send_from_directory
 
 import config
+import eligibility
 import engine
 import logbook as logbook_module
 import processes
@@ -24,6 +25,7 @@ def create_app():
     )
 
     @app.errorhandler(processes.ProcessError)
+    @app.errorhandler(snapshot_module.SnapshotError)
     @app.errorhandler(ValueError)
     def _bad_request(error):
         return _error(error, 400)
@@ -48,8 +50,23 @@ def create_app():
 
     @app.get("/api/processes")
     def list_processes():
+        # the panel shows the restorable processes only, 'all' brings the
+        # rejected ones back so the reason is visible
+        include_all = request.args.get("all", "").lower() in ("1", "true", "yes")
+        found, kernel_threads = processes.list_processes(request.args.get("query"))
+        # one engine call answers for the whole listing
+        eligibility.verdicts_for(found)
+        visible = [
+            process
+            for process in found
+            if include_all or process["eligibility"]["level"] != eligibility.BLOCKED
+        ]
         return jsonify(
-            {"processes": processes.list_processes(request.args.get("query"))}
+            {
+                "processes": visible,
+                "counts": eligibility.count_levels(found),
+                "kernel_threads": kernel_threads,
+            }
         )
 
     @app.get("/api/snapshots")
@@ -71,7 +88,18 @@ def create_app():
     def dump():
         payload = request.get_json(silent=True) or {}
         pid = processes.validate_pid(payload.get("pid"))
+        # the engine decides, including its ptrace probe, so the API is not
+        # merely decorated by the GUI
+        verdict = eligibility.require_dumpable(pid)
         name = payload.get("name") or "pid-%d.ksnap" % pid
+
+        # a risky target still gets its dump, but the console says why the
+        # restore may not be faithful
+        for caveat in eligibility.describe(verdict, eligibility.RISKY):
+            engine.logbook.append(
+                "pid %d: %s" % (pid, caveat), source="eligibility"
+            )
+
         return jsonify({"snapshot": engine.dump(pid, name)})
 
     @app.post("/api/restore")

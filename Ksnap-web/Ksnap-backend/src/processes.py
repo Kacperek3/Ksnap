@@ -1,7 +1,9 @@
 """Process listing straight from /proc.
 
-The engine reads /proc/<pid>/{maps,mem,exe} itself, so the panel stays on the
-same source of truth instead of pulling in an external dependency.
+Only the fields the table shows are read here. Whether a process is a usable
+dump target is not decided in this module and not in Python at all: the engine
+answers that through 'Ksnap -m Check', and eligibility.py attaches its verdict
+to these rows by pid.
 """
 
 import os
@@ -26,10 +28,11 @@ class ProcessError(Exception):
     """The requested pid cannot be used as a dump target."""
 
 
-def _read(path):
+def read_text(path):
+    """File contents, or None when the file or the process is gone."""
     try:
         return path.read_text(errors="replace")
-    except (OSError, PermissionError):
+    except OSError:
         return None
 
 
@@ -51,11 +54,12 @@ def _parse_stat(raw):
     return comm, rest
 
 
-def read_process(pid, proc=PROC):
-    """One process as a dict, or None when it is gone or not dumpable."""
+def read_process(pid, proc=None):
+    """One process as a dict, or None when it is gone or has no address space."""
+    proc = proc or PROC
     directory = proc / str(pid)
 
-    stat_raw = _read(directory / "stat")
+    stat_raw = read_text(directory / "stat")
     if stat_raw is None:
         return None
 
@@ -67,65 +71,72 @@ def read_process(pid, proc=PROC):
     state = fields[0]
     threads = int(fields[17])
 
-    cmdline_raw = _read(directory / "cmdline") or ""
-    cmdline = " ".join(part for part in cmdline_raw.split("\x00") if part)
+    cmdline_raw = read_text(directory / "cmdline") or ""
+    arguments = [part for part in cmdline_raw.split("\x00") if part]
 
     # kernel threads own no address space, there is nothing to snapshot
-    if not cmdline:
+    if not arguments:
         return None
 
     uid = None
     rss_kb = 0
-    status_raw = _read(directory / "status") or ""
-    for line in status_raw.splitlines():
+    for line in (read_text(directory / "status") or "").splitlines():
         if line.startswith("Uid:"):
             uid = int(line.split()[1])
         elif line.startswith("VmRSS:"):
             rss_kb = int(line.split()[1])
 
-    try:
-        stat_result = (directory).stat()
-        uid = uid if uid is not None else stat_result.st_uid
-    except OSError:
-        uid = uid if uid is not None else 0
+    if uid is None:
+        try:
+            uid = directory.stat().st_uid
+        except OSError:
+            uid = 0
 
     return {
         "pid": int(pid),
         "name": comm,
-        "cmdline": cmdline,
+        "cmdline": " ".join(arguments),
         "user": _username(uid),
         "state": STATE_NAMES.get(state, state),
         "threads": threads,
         "rss_kb": rss_kb,
-        # the MVP engine handles single threaded processes only
-        "supported": threads == 1,
     }
 
 
-def list_processes(query=None, proc=PROC):
-    """Every dumpable process, optionally filtered by pid or name."""
+def _matches(process, query):
+    """Whether the free text *query* hits the pid, the name or the command."""
+    return (
+        query in str(process["pid"])
+        or query in process["name"].lower()
+        or query in process["cmdline"].lower()
+    )
+
+
+def list_processes(query=None, proc=None):
+    """Every process with an address space, plus the kernel thread count."""
+    proc = proc or PROC
     query = (query or "").strip().lower()
-    processes = []
+    found = []
+    kernel_threads = 0
 
     for entry in proc.iterdir():
         if not entry.name.isdigit():
             continue
         process = read_process(entry.name, proc=proc)
         if process is None:
+            kernel_threads += 1
             continue
-        if query and query not in str(process["pid"]) and (
-            query not in process["name"].lower()
-            and query not in process["cmdline"].lower()
-        ):
+        if query and not _matches(process, query):
             continue
-        processes.append(process)
+        found.append(process)
 
-    processes.sort(key=lambda item: item["pid"])
-    return processes
+    found.sort(key=lambda item: item["pid"])
+    return found, kernel_threads
 
 
-def validate_pid(value, proc=PROC):
+def validate_pid(value, proc=None):
     """Return a pid that is safe to hand to the engine, or raise ProcessError."""
+    proc = proc or PROC
     try:
         pid = int(value)
     except (TypeError, ValueError):
