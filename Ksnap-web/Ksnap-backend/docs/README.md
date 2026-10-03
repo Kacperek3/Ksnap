@@ -14,11 +14,11 @@ Ksnap engine (C, ptrace + /proc)
 
 ## Requirements
 
-* Python 3 with Flask (`python3 -c "import flask"` must succeed)
+* `pip install -r Ksnap-web/Ksnap-backend/requirements.txt` (Flask, nothing else)
 * the engine built: `cd Ksnap-engine && make`
 
-There are no other dependencies; the API reads `/proc` and parses the snapshot
-header with the standard library only.
+That one dependency is the whole list; the API reads `/proc` and parses the
+snapshot header with the standard library only.
 
 ## Running
 
@@ -142,6 +142,19 @@ would collide.
 ```
 python3 -m unittest discover -s Ksnap-web/Ksnap-backend/tests -t Ksnap-web/Ksnap-backend/tests
 ```
+
+These run without the engine: the Check output it would produce is canned in
+`tests/test_check.py`, so the panel is tested against the contract rather than
+against a build. The engine has its own tests, which do need root:
+
+```
+cd Ksnap-engine && make test
+```
+
+`.github/workflows/ci.yml` runs exactly these two commands, plus a build with
+`-Werror` and a `clang-format` check, on every push to `devel` or `main` and on
+every pull request to `main`. Nothing in CI is unavailable locally, so a red
+check can always be reproduced with the commands above.
 
 ## Known limitations (MVP scope of the engine)
 
