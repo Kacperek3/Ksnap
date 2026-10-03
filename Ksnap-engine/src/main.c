@@ -1,4 +1,5 @@
 
+#include "checker.h"
 #include "config.h"
 #include "dumper.h"
 #include "parser.h"
@@ -20,6 +21,10 @@ int main(int argc, char **argv) {
     } else if (!strcmp(config.mode, "RESTORE")) {
         if (restorer(config) != OK)
             return EXIT_FAILURE;
+    } else if (!strcmp(config.mode, "CHECK")) {
+        // Check has its own exit codes, a refused process is not a failure of
+        // the tool, so the status is passed through untouched
+        return check(config);
     }
     return EXIT_SUCCESS;
 }

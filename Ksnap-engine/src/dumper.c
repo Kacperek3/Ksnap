@@ -44,9 +44,6 @@ static int write_snapshot(pid_t pid, const char *snapshot_path,
 //
 static int write_vma_payload(FILE *snapshot_handle, int mem_vma_handle,
                              const vma_descriptor_t *vma, char buff[]);
-static bool is_dumpable_path(const char *maps_path);
-static uint32_t perms_to_prot(const char privileges[5]);
-static uint32_t perms_to_map_flags(const char privileges[5]);
 
 int dump(ksnap_config_t config) {
     int status;
@@ -207,8 +204,13 @@ static int collect_vmas(pid_t pid, vma_descriptor_t **out_vmas,
             continue;
         }
 
-        // the content is useless to copy but the address has to come back
-        if (is_kernel_map(parsed.path)) {
+        vma_class_t vma_class = classify_maps_line(&parsed);
+
+        if (vma_class == VMA_SKIP_UNREADABLE || vma_class == VMA_SKIP_SHARED ||
+            vma_class == VMA_SKIP_PSEUDO)
+            continue;
+
+        if (vma_class == VMA_KERNEL) {
             if (kernel_map_count == KSNAP_MAX_KERNEL_MAPS) {
                 fprintf(stderr,
                         "Error: process %d has more than %d kernel mappings\n",
@@ -233,14 +235,6 @@ static int collect_vmas(pid_t pid, vma_descriptor_t **out_vmas,
             kernel_map_count++;
             continue;
         }
-
-        if (parsed.privileges[0] != 'r')
-            continue; // segment must be readable
-        if (parsed.privileges[3] != 'p')
-            continue; // segment memory must be private
-
-        if (!is_dumpable_path(parsed.path))
-            continue; // kernel owned pseudo mapping
 
         if (count == capacity) {
             uint32_t new_capacity =
@@ -477,27 +471,3 @@ static int write_vma_payload(FILE *snapshot_handle, int mem_vma_handle,
     return OK;
 }
 
-static bool is_dumpable_path(const char *maps_path) {
-    if (maps_path[0] != '[')
-        return true; // anonymous mapping or a regular file
-
-    return strcmp(maps_path, "[heap]") == 0 ||
-           strcmp(maps_path, "[stack]") == 0;
-}
-
-static uint32_t perms_to_prot(const char privileges[5]) {
-    uint32_t prot = PROT_NONE;
-
-    if (privileges[0] == 'r')
-        prot |= PROT_READ;
-    if (privileges[1] == 'w')
-        prot |= PROT_WRITE;
-    if (privileges[2] == 'x')
-        prot |= PROT_EXEC;
-
-    return prot;
-}
-
-static uint32_t perms_to_map_flags(const char privileges[5]) {
-    return privileges[3] == 'p' ? MAP_PRIVATE : MAP_SHARED;
-}
