@@ -50,23 +50,35 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# start a program in the background and echo its pid
+# Start a program in the background and leave its pid in START_PID.
+#
+# It reports through a variable rather than stdout on purpose: called as
+# $(start ...) the whole function would run in a subshell and the PIDS it
+# appends to, which cleanup kills, would be lost with that subshell.
+START_PID=""
 start() {
     setsid "$@" >/dev/null 2>&1 </dev/null &
-    local pid=$!
-    PIDS+=("$pid")
+    START_PID=$!
+    PIDS+=("$START_PID")
     sleep 1
-    echo "$pid"
 }
 
-# one field out of one JSON line, without assuming the key order
+# one field out of one JSON line, without assuming the key order. A numeric
+# step indexes a list, so 'reasons.0.code' reaches into the first reason.
+#
+# A path that does not resolve prints nothing instead of raising: the caller
+# then fails its own assertion and prints the whole report, which says far more
+# than a traceback would.
 field() {
     python3 -c "
 import json, sys
-report = json.loads(sys.stdin.read())
-value = report
-for key in sys.argv[1].split('.'):
-    value = value[key]
+
+try:
+    value = json.loads(sys.stdin.read())
+    for key in sys.argv[1].split('.'):
+        value = value[int(key)] if key.isdigit() else value[key]
+except (ValueError, LookupError, TypeError):
+    value = ''
 print(value)
 " "$1"
 }
@@ -83,7 +95,8 @@ sudo -v || fail "sudo authentication failed"
 # ---------------------------------------------------------------- 1. the green
 # case, a single threaded static program is exactly what the engine handles
 
-COUNTER_PID="$(start "$COUNTER")"
+start "$COUNTER"
+COUNTER_PID="$START_PID"
 REPORT="$(sudo -n "$KSNAP" -m Check -p "$COUNTER_PID")"
 RC=$?
 
@@ -135,7 +148,8 @@ pass "snapshot_bytes matches the payload the dump wrote ($WRITTEN B)"
 
 # ------------------------------------------------------ 3. multi threaded case
 
-THREADS_PID="$(start "$THREADS")"
+start "$THREADS"
+THREADS_PID="$START_PID"
 REPORT="$(sudo -n "$KSNAP" -m Check -p "$THREADS_PID")"
 RC=$?
 
@@ -150,7 +164,8 @@ pass "a multi threaded process is refused with multi_threaded, exit 11"
 
 DELETED_COPY="$SNAPSHOT_DIR/counter-copy"
 cp "$COUNTER" "$DELETED_COPY"
-DELETED_PID="$(start "$DELETED_COPY")"
+start "$DELETED_COPY"
+DELETED_PID="$START_PID"
 rm -f "$DELETED_COPY"
 
 REPORT="$(sudo -n "$KSNAP" -m Check -p "$DELETED_PID")"
@@ -161,18 +176,36 @@ pass "a process whose binary is gone is refused with exe_deleted"
 # --------------------------------------------------------- 5. traced processes
 
 if command -v strace >/dev/null; then
-    TRACED_PID="$(start "$COUNTER")"
-    sudo -n strace -p "$TRACED_PID" -o /dev/null &
+    # the counter is started *under* strace rather than attached to afterwards:
+    # the tracer is then its parent, so there is no race with the attach and no
+    # dependency on yama ptrace_scope
+    setsid strace -o /dev/null "$COUNTER" >/dev/null 2>&1 </dev/null &
     STRACE_PID=$!
     PIDS+=("$STRACE_PID")
-    sleep 1
 
-    REPORT="$(sudo -n "$KSNAP" -m Check -p "$TRACED_PID")"
-    CODE="$(echo "$REPORT" | field 'reasons.0.code')"
-    [ "$CODE" = "already_traced" ] || [ "$CODE" = "ptrace_refused" ] ||
-        fail "a traced process was not refused: $REPORT"
-    sudo -n kill -9 "$STRACE_PID" 2>/dev/null
-    pass "a process under another tracer is refused with $CODE"
+    # wait for the precondition instead of assuming a sleep is enough
+    TRACED_PID=""
+    for _ in $(seq 20); do
+        TRACED_PID="$(pgrep -P "$STRACE_PID" 2>/dev/null | head -n 1)"
+        if [ -n "$TRACED_PID" ] &&
+            [ "$(awk '/TracerPid:/ {print $2}' "/proc/$TRACED_PID/status" \
+                2>/dev/null)" != "0" ]; then
+            break
+        fi
+        TRACED_PID=""
+        sleep 0.2
+    done
+
+    if [ -z "$TRACED_PID" ]; then
+        skip "strace never took the process, cannot test already_traced"
+    else
+        PIDS+=("$TRACED_PID")
+        REPORT="$(sudo -n "$KSNAP" -m Check -p "$TRACED_PID")"
+        CODE="$(echo "$REPORT" | field 'reasons.0.code')"
+        [ "$CODE" = "already_traced" ] || [ "$CODE" = "ptrace_refused" ] ||
+            fail "a traced process was not refused: $REPORT"
+        pass "a process under another tracer is refused with $CODE"
+    fi
 else
     skip "no strace, cannot test the already_traced case"
 fi
