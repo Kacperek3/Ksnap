@@ -25,15 +25,25 @@ build/%.o : src/%.c
 # the counter binaries are committed on purpose, the restore test depends on
 # their exact layout, so only the helpers that are not a dump target are built
 # here
-test_programs: test_programs/threads
+test_programs: test_programs/threads test_programs/fpu_rounding \
+	test_programs/fpu_spin
 
 test_programs/threads: test_programs/threads.c
 	$(CC) -pthread -O0 -g $< -o $@
+
+# static and non-PIE like counter_static_noPie, the layout the restore handles
+test_programs/fpu_rounding: test_programs/fpu_rounding.c
+	$(CC) -static -no-pie -O0 -g $< -o $@ -lm
+
+# -O2 keeps the accumulator in a register, -mavx makes that register a ymm one
+test_programs/fpu_spin: test_programs/fpu_spin.c
+	$(CC) -static -no-pie -O2 -mavx -g $< -o $@
 
 test: test_programs
 	test/./test_restore_validation.sh
 	test/./test_static_noPie.sh
 	test/./test_check.sh
+	test/./test_fpu.sh
 
 clean:
 	rm -rf build/*

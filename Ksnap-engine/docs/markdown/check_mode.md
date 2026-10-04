@@ -60,8 +60,8 @@ panel turns those into its own three levels (`Ksnap-web/Ksnap-backend/src/eligib
 | `ptrace_probed`, `ptrace_ok` | whether the ptrace probe ran, and whether it worked |
 
 `snapshot_bytes` is the exact size the dump will write after the header, the
-descriptor table and the path pool, which is why
-`Ksnap-engine/test/test_check.sh` asserts it against a real dump. That
+descriptor table, the path pool and the XSAVE area (FPU/SSE/AVX state), which
+is why `Ksnap-engine/test/test_check.sh` asserts it against a real dump. That
 assertion is what keeps Check and Dump from drifting apart.
 
 ### reasons

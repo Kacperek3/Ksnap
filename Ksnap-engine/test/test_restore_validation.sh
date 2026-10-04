@@ -59,17 +59,25 @@ MAX_KERNEL_MAPS = 4
 REGS = 27
 PAGE = 4096
 VMA_SIZE = 48  # sizeof(vma_descriptor_t), asserted in dump_format.h
+XSTATE = 576  # KSNAP_XSTATE_MIN_SIZE, the smallest XSAVE area accepted
 
-HEADER = "<8sIIQQQQI%dsI" % PATH_MAX + "QQ32s" * MAX_KERNEL_MAPS + "%dQ" % REGS
+HEADER = (
+    "<8sIIQQQQI%dsI" % PATH_MAX
+    + "QQ32s" * MAX_KERNEL_MAPS
+    + "%dQ" % REGS
+    + "QII"
+)
 
 fields = {
     "magic": b"KSNAPDMP",
-    "version": 2,
+    "version": 3,
     "vma_count": 1,
     "vma_table_offset": struct.calcsize(HEADER),
     "path_pool_offset": struct.calcsize(HEADER) + VMA_SIZE,
     "path_pool_size": 0,
-    "data_offset": struct.calcsize(HEADER) + VMA_SIZE,
+    "xstate_offset": struct.calcsize(HEADER) + VMA_SIZE,
+    "xstate_size": XSTATE,
+    "data_offset": struct.calcsize(HEADER) + VMA_SIZE + XSTATE,
     "exe_path": b"/bin/counter",
     # derived from exe_path unless a case overrides it on purpose
     "exe_path_len": None,
@@ -78,7 +86,7 @@ fields = {
     # 0 writes filler, which is enough for the header only cases
     "vma": 0,
     # how many filler bytes to put behind the header
-    "body": VMA_SIZE + PAGE,
+    "body": VMA_SIZE + XSTATE + PAGE,
 }
 
 for argument in sys.argv[2:]:
@@ -109,6 +117,9 @@ header = struct.pack(
     fields["kernel_map_count"],
     *([0, 0, b""] * MAX_KERNEL_MAPS),
     *([0] * REGS),
+    fields["xstate_offset"],
+    fields["xstate_size"],
+    0,
 )
 
 if fields["vma"]:
@@ -125,7 +136,7 @@ if fields["vma"]:
         0x22,
         0,
         0,
-    ) + b"\0" * PAGE
+    ) + b"\0" * (XSTATE + PAGE)
 else:
     body = b"\0" * fields["body"]
 
@@ -181,6 +192,18 @@ refused_with nopath.ksnap "executable path" "an empty executable path"
 
 write_snapshot "$WORK_DIR/longpath.ksnap" exe_path_len=9999
 refused_with longpath.ksnap "executable path" "an executable path longer than PATH_MAX"
+
+# the XSAVE area is sized by the CPU, but never below the legacy region plus
+# its header, and never large enough to be an allocation attack
+write_snapshot "$WORK_DIR/noxstate.ksnap" xstate_size=0
+refused_with noxstate.ksnap "xstate size" "a snapshot without the FPU/SSE/AVX state"
+
+write_snapshot "$WORK_DIR/hugexstate.ksnap" xstate_size=4000000000
+refused_with hugexstate.ksnap "xstate size" "an absurd FPU/SSE/AVX state size"
+
+# the header promises an XSAVE area the file does not hold
+write_snapshot "$WORK_DIR/cutxstate.ksnap" xstate_offset=999999999
+refused_with cutxstate.ksnap "truncated" "an FPU/SSE/AVX state past the end of the file"
 
 # nothing behind the header, so the table and the payload cannot be there
 write_snapshot "$WORK_DIR/short.ksnap" body=0

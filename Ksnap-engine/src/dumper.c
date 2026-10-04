@@ -21,13 +21,16 @@
 #include "dump_format.h"
 #include "dumper.h"
 #include "maps.h"
+#include <elf.h> // for NT_X86_XSTATE
 #include <fcntl.h>
+#include <sys/uio.h> // for struct iovec
 
 #define VMA_TABLE_INITIAL_CAPACITY 64
 #define PATH_POOL_INITIAL_CAPACITY 4096
 
 // private main functions
 static int read_regs(pid_t pid, struct user_regs_struct *regs);
+static int read_xstate(pid_t pid, void **out_xstate, uint32_t *out_size);
 static int read_exe_path(pid_t pid, char exe_path[PATH_MAX],
                          uint32_t *exe_path_len);
 static int collect_vmas(pid_t pid, vma_descriptor_t **out_vmas,
@@ -36,6 +39,7 @@ static int collect_vmas(pid_t pid, vma_descriptor_t **out_vmas,
                         uint32_t *out_kernel_map_count);
 static int write_snapshot(pid_t pid, const char *snapshot_path,
                           const struct user_regs_struct *regs,
+                          const void *xstate, uint32_t xstate_size,
                           const char *exe_path, uint32_t exe_path_len,
                           vma_descriptor_t *vmas, uint32_t vma_count,
                           const char *pool, uint64_t pool_size,
@@ -50,6 +54,8 @@ int dump(ksnap_config_t config) {
     int result = ERROR;
 
     struct user_regs_struct regs;
+    void *xstate = NULL;
+    uint32_t xstate_size = 0;
     char exe_path[PATH_MAX];
     uint32_t exe_path_len = 0;
     vma_descriptor_t *vmas = NULL;
@@ -101,6 +107,11 @@ int dump(ksnap_config_t config) {
     // 1.
     if (read_regs(config.pid, &regs) != OK)
         goto detach;
+    // 1b. the general registers alone are not the whole CPU state, a process
+    // stopped in the middle of a computation keeps live values in xmm/ymm and
+    // its rounding mode in MXCSR
+    if (read_xstate(config.pid, &xstate, &xstate_size) != OK)
+        goto detach;
     // 2.
     if (read_exe_path(config.pid, exe_path, &exe_path_len) != OK)
         goto detach;
@@ -110,14 +121,15 @@ int dump(ksnap_config_t config) {
                      kernel_maps, &kernel_map_count) != OK)
         goto detach;
     // 4.
-    if (write_snapshot(config.pid, snapshot_path, &regs, exe_path, exe_path_len,
-                       vmas, vma_count, path_pool, path_pool_size, kernel_maps,
-                       kernel_map_count) != OK)
+    if (write_snapshot(config.pid, snapshot_path, &regs, xstate, xstate_size,
+                       exe_path, exe_path_len, vmas, vma_count, path_pool,
+                       path_pool_size, kernel_maps, kernel_map_count) != OK)
         goto detach;
 
     result = OK;
 
 detach:
+    free(xstate);
     free(vmas);
     free(path_pool);
 
@@ -135,6 +147,37 @@ static int read_regs(pid_t pid, struct user_regs_struct *regs) {
         perror("Error: cannot read the registers of the target");
         return ERROR;
     }
+    return OK;
+}
+
+// fpu dump
+static int read_xstate(pid_t pid, void **out_xstate, uint32_t *out_size) {
+    void *xstate = calloc(1, KSNAP_XSTATE_MAX_SIZE);
+    if (xstate == NULL) {
+        perror("Error: out of memory for the xstate");
+        return ERROR;
+    }
+
+    struct iovec iov = {.iov_base = xstate, .iov_len = KSNAP_XSTATE_MAX_SIZE};
+
+    if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_X86_XSTATE, &iov) == -1) {
+        perror("Error: cannot read the FPU/SSE/AVX state of the target");
+        free(xstate);
+        return ERROR;
+    }
+
+    // a full buffer could mean the area was cut short, restoring half of it
+    // would be worse than refusing
+    if (iov.iov_len < KSNAP_XSTATE_MIN_SIZE ||
+        iov.iov_len >= KSNAP_XSTATE_MAX_SIZE) {
+        fprintf(stderr, "Error: unexpected xstate size of %zu bytes\n",
+                iov.iov_len);
+        free(xstate);
+        return ERROR;
+    }
+
+    *out_xstate = xstate;
+    *out_size = (uint32_t)iov.iov_len;
     return OK;
 }
 
@@ -319,6 +362,7 @@ cleanup:
 
 static int write_snapshot(pid_t pid, const char *snapshot_path,
                           const struct user_regs_struct *regs,
+                          const void *xstate, uint32_t xstate_size,
                           const char *exe_path, uint32_t exe_path_len,
                           vma_descriptor_t *vmas, uint32_t vma_count,
                           const char *pool, uint64_t pool_size,
@@ -358,7 +402,9 @@ static int write_snapshot(pid_t pid, const char *snapshot_path,
     header.path_pool_offset =
         header.vma_table_offset + (uint64_t)vma_count * sizeof(*vmas);
     header.path_pool_size = pool_size;
-    header.data_offset = header.path_pool_offset + pool_size;
+    header.xstate_offset = header.path_pool_offset + pool_size;
+    header.xstate_size = xstate_size;
+    header.data_offset = header.xstate_offset + xstate_size;
     header.exe_path_len = exe_path_len;
     memcpy(header.exe_path, exe_path, exe_path_len);
     header.kernel_map_count = kernel_map_count;
@@ -386,6 +432,11 @@ static int write_snapshot(pid_t pid, const char *snapshot_path,
     if (pool_size > 0 &&
         fwrite(pool, 1, pool_size, snapshot_handle) != pool_size) {
         perror("Write operation failure (snapshot path pool)");
+        goto cleanup;
+    }
+
+    if (fwrite(xstate, 1, xstate_size, snapshot_handle) != xstate_size) {
+        perror("Write operation failure (snapshot xstate)");
         goto cleanup;
     }
 

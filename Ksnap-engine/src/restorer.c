@@ -3,6 +3,7 @@
 #include "restorer.h"
 #include "dump_format.h"
 #include "maps.h"
+#include <elf.h> // for NT_X86_XSTATE
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -20,6 +21,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <sys/user.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -30,19 +32,22 @@
 // private functions
 static int read_snapshot_metadata(FILE *snapshot_handle,
                                   ksnap_dump_header_t *header,
-                                  vma_descriptor_t **out_vmas);
+                                  vma_descriptor_t **out_vmas,
+                                  void **out_xstate);
 static int restore_vma(pid_t pid, int mem_fd, FILE *snapshot_handle,
                        const vma_descriptor_t *vma, char buff[]);
 static int restore_kernel_maps(pid_t pid, const ksnap_dump_header_t *header);
 static int inject_mmap_syscall(pid_t pid, const vma_descriptor_t *vma);
 static int spawn_traced_child(const char *exe_path);
 static int set_final_regs(pid_t pid, const struct user_regs_struct *regs);
+static int set_final_xstate(pid_t pid, void *xstate, uint32_t xstate_size);
 // ------
 
 int restorer(ksnap_config_t config) {
     int result = ERROR;
     ksnap_dump_header_t header;
     vma_descriptor_t *vmas = NULL;
+    void *xstate = NULL;
     char snapshot_path[PATH_MAX];
 
     if (build_snapshot_path(&config, snapshot_path) != OK)
@@ -55,7 +60,8 @@ int restorer(ksnap_config_t config) {
         return ERROR;
     }
 
-    if (read_snapshot_metadata(snapshot_handle, &header, &vmas) != OK) {
+    if (read_snapshot_metadata(snapshot_handle, &header, &vmas, &xstate) !=
+        OK) {
         fclose(snapshot_handle);
         return ERROR;
     }
@@ -64,6 +70,7 @@ int restorer(ksnap_config_t config) {
     if (new_process < 0) {
         perror("fork fail");
         free(vmas);
+        free(xstate);
         fclose(snapshot_handle);
         return ERROR;
     } else if (new_process == CHILD) {
@@ -71,6 +78,7 @@ int restorer(ksnap_config_t config) {
         // the snapshot must not leak into the restored process
         fclose(snapshot_handle);
         free(vmas);
+        free(xstate);
         spawn_traced_child(header.exe_path);
     } else
         PARENT {
@@ -82,7 +90,8 @@ int restorer(ksnap_config_t config) {
                 // 1. metadata is already loaded
                 // 2. use mmap with syscalls to recreate every area
                 // 3. copy the payload of each area into the child
-                // 4. change current registers to those from the snapshot
+                // 4. change current registers to those from the snapshot,
+                //    the general ones and the FPU/SSE/AVX state
                 // 5. wake up the child process
 
                 //
@@ -132,6 +141,13 @@ int restorer(ksnap_config_t config) {
                     set_final_regs(new_process, &header.regs) != OK)
                     result = ERROR;
 
+                // last, so no injected syscall runs with the snapshot state.
+                // The kernel keeps the user FPU state across syscalls anyway,
+                // the order only makes that easy to see.
+                if (result == OK && set_final_xstate(new_process, xstate,
+                                                     header.xstate_size) != OK)
+                    result = ERROR;
+
                 if (result == OK) {
                     ptrace(PTRACE_DETACH, new_process, NULL, NULL);
                     waitpid(new_process, &status, 0);
@@ -162,13 +178,15 @@ int restorer(ksnap_config_t config) {
         }
 
     free(vmas);
+    free(xstate);
     fclose(snapshot_handle);
     return result;
 }
 
 static int read_snapshot_metadata(FILE *snapshot_handle,
                                   ksnap_dump_header_t *header,
-                                  vma_descriptor_t **out_vmas) {
+                                  vma_descriptor_t **out_vmas,
+                                  void **out_xstate) {
     struct stat snapshot_stat;
 
     if (fread(header, sizeof(*header), 1, snapshot_handle) != 1) {
@@ -223,6 +241,22 @@ static int read_snapshot_metadata(FILE *snapshot_handle,
         return ERROR;
     }
 
+    // the size is chosen by the CPU of the dumping machine, the bounds only
+    // catch a damaged file, the content itself is judged by the kernel
+    if (header->xstate_size < KSNAP_XSTATE_MIN_SIZE ||
+        header->xstate_size >= KSNAP_XSTATE_MAX_SIZE) {
+        fprintf(stderr,
+                "Error: snapshot has an impossible xstate size of %u bytes\n",
+                header->xstate_size);
+        return ERROR;
+    }
+
+    if (header->xstate_offset + header->xstate_size >
+        (uint64_t)snapshot_stat.st_size) {
+        fprintf(stderr, "Error: snapshot is truncated\n");
+        return ERROR;
+    }
+
     uint64_t table_size = (uint64_t)header->vma_count * sizeof(**out_vmas);
     if (header->vma_table_offset + table_size >
             (uint64_t)snapshot_stat.st_size ||
@@ -258,7 +292,24 @@ static int read_snapshot_metadata(FILE *snapshot_handle,
         }
     }
 
+    void *xstate = malloc(header->xstate_size);
+    if (xstate == NULL) {
+        perror("Error: out of memory for the xstate");
+        free(vmas);
+        return ERROR;
+    }
+
+    if (fseek(snapshot_handle, (long)header->xstate_offset, SEEK_SET) != 0 ||
+        fread(xstate, 1, header->xstate_size, snapshot_handle) !=
+            header->xstate_size) {
+        perror("Read operation failure (snapshot xstate)");
+        free(xstate);
+        free(vmas);
+        return ERROR;
+    }
+
     *out_vmas = vmas;
+    *out_xstate = xstate;
     return OK;
 }
 
@@ -508,6 +559,23 @@ static int set_final_regs(pid_t pid, const struct user_regs_struct *regs) {
 
     if (ptrace(PTRACE_SETREGS, pid, NULL, &final_regs) == -1) {
         perror("Error: cannot restore the registers of the child");
+        return ERROR;
+    }
+
+    return OK;
+}
+
+// restore fpu registers
+static int set_final_xstate(pid_t pid, void *xstate, uint32_t xstate_size) {
+    struct iovec iov = {.iov_base = xstate, .iov_len = xstate_size};
+
+    if (ptrace(PTRACE_SETREGSET, pid, (void *)NT_X86_XSTATE, &iov) == -1) {
+        if (errno == EINVAL)
+            fprintf(stderr,
+                    "Error: the FPU/SSE/AVX state of the snapshot does not fit "
+                    "this CPU, was it taken on another machine?\n");
+        else
+            perror("Error: cannot restore the FPU/SSE/AVX state of the child");
         return ERROR;
     }
 
