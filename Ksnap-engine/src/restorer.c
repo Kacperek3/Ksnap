@@ -38,6 +38,8 @@ static int restore_vma(pid_t pid, int mem_fd, FILE *snapshot_handle,
                        const vma_descriptor_t *vma, char buff[]);
 static int restore_kernel_maps(pid_t pid, const ksnap_dump_header_t *header);
 static int inject_mmap_syscall(pid_t pid, const vma_descriptor_t *vma);
+static int restore_protections(pid_t pid, const vma_descriptor_t *vmas,
+                               uint32_t vma_count);
 static int spawn_traced_child(const char *exe_path);
 static int set_final_regs(pid_t pid, const struct user_regs_struct *regs);
 static int set_final_xstate(pid_t pid, void *xstate, uint32_t xstate_size);
@@ -89,7 +91,8 @@ int restorer(ksnap_config_t config) {
 
                 // 1. metadata is already loaded
                 // 2. use mmap with syscalls to recreate every area
-                // 3. copy the payload of each area into the child
+                // 3. copy the payload of each area into the child, then
+                //    give every area the protection it had in the snapshot
                 // 4. change current registers to those from the snapshot,
                 //    the general ones and the FPU/SSE/AVX state
                 // 5. wake up the child process
@@ -135,6 +138,14 @@ int restorer(ksnap_config_t config) {
                         }
                     }
                     close(mem_new_process_file_handle);
+
+                    // only once every payload is in, writing through
+                    // /proc/pid/mem does not care, but the injection site has
+                    // to stay executable until the last injected syscall
+                    if (result == OK &&
+                        restore_protections(new_process, vmas,
+                                            header.vma_count) != OK)
+                        result = ERROR;
                 }
 
                 if (result == OK &&
@@ -279,8 +290,18 @@ static int read_snapshot_metadata(FILE *snapshot_handle,
         return ERROR;
     }
 
-    // a payload past the end of the file would write garbage into the child
+    // a payload past the end of the file would write garbage into the child,
+    // and a protection mprotect does not know would fail only after the fork
     for (uint32_t i = 0; i < header->vma_count; i++) {
+        if (vmas[i].prot & ~(uint32_t)(PROT_READ | PROT_WRITE | PROT_EXEC)) {
+            fprintf(stderr,
+                    "Error: mapping 0x%" PRIx64 " has an unknown protection "
+                    "0x%x\n",
+                    vmas[i].start_address, vmas[i].prot);
+            free(vmas);
+            return ERROR;
+        }
+
         if (vmas[i].data_offset + vmas[i].size >
             (uint64_t)snapshot_stat.st_size) {
             fprintf(stderr,
@@ -437,9 +458,9 @@ static bool syscall_failed(unsigned long long syscall_result) {
 static int inject_mmap_syscall(pid_t pid, const vma_descriptor_t *vma) {
     unsigned long long syscall_result;
 
-    // TODO: the recorded vma->prot is what the mapping should end up with
-    // but the injection site itself lives in one of these areas and has to
-    // stay executable so the protections are applied in a later pass
+    // every area starts as RWX, the recorded vma->prot is applied later by
+    // restore_protections, because the injection site lives in one of these
+    // areas and has to stay executable while syscalls are still injected
 
     if (inject_syscall(pid, SYS_mmap, vma->start_address, vma->size,
                        PROT_READ | PROT_WRITE | PROT_EXEC,
@@ -452,6 +473,63 @@ static int inject_mmap_syscall(pid_t pid, const vma_descriptor_t *vma) {
                 vma->start_address, strerror(-(long)syscall_result));
         return ERROR;
     }
+
+    return OK;
+}
+
+static int inject_mprotect_syscall(pid_t pid, const vma_descriptor_t *vma) {
+    unsigned long long syscall_result;
+
+    if (inject_syscall(pid, SYS_mprotect, vma->start_address, vma->size,
+                       vma->prot, 0, 0, 0, &syscall_result) != OK)
+        return ERROR;
+
+    if (syscall_failed(syscall_result)) {
+        fprintf(stderr, "Error: mprotect of 0x%" PRIx64 " failed: %s\n",
+                vma->start_address, strerror(-(long)syscall_result));
+        return ERROR;
+    }
+
+    return OK;
+}
+
+// give every area the protection recorded in the snapshot. inject_syscall
+// plants its syscall opcode at the current rip of the child, so the area
+// holding rip must stay executable until the end: it is protected last, and the
+// single step of that very mprotect completes before the new protection could
+// matter. PTRACE_POKETEXT writes the original code back regardless of the
+// protection.
+static int restore_protections(pid_t pid, const vma_descriptor_t *vmas,
+                               uint32_t vma_count) {
+    struct user_regs_struct regs;
+    uint32_t site = vma_count; // none, the injection site may lie elsewhere
+
+    if (ptrace(PTRACE_GETREGS, pid, NULL, &regs) == -1) {
+        perror("Error: cannot read the registers of the child");
+        return ERROR;
+    }
+
+    for (uint32_t i = 0; i < vma_count; i++) {
+        if (regs.rip >= vmas[i].start_address &&
+            regs.rip < vmas[i].start_address + vmas[i].size) {
+            site = i;
+            break;
+        }
+    }
+
+    for (uint32_t i = 0; i < vma_count; i++) {
+        // RWX is what the area already has, the syscall would change nothing
+        if (i == site || vmas[i].prot == (PROT_READ | PROT_WRITE | PROT_EXEC))
+            continue;
+
+        if (inject_mprotect_syscall(pid, &vmas[i]) != OK)
+            return ERROR;
+    }
+
+    if (site < vma_count &&
+        vmas[site].prot != (PROT_READ | PROT_WRITE | PROT_EXEC) &&
+        inject_mprotect_syscall(pid, &vmas[site]) != OK)
+        return ERROR;
 
     return OK;
 }

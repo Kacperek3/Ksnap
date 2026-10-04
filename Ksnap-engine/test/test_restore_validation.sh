@@ -85,6 +85,8 @@ fields = {
     # 1 writes a real descriptor for a mapping at an address mmap must refuse,
     # 0 writes filler, which is enough for the header only cases
     "vma": 0,
+    # PROT_* of that descriptor
+    "prot": 0x7,
     # how many filler bytes to put behind the header
     "body": VMA_SIZE + XSTATE + PAGE,
 }
@@ -132,7 +134,7 @@ if fields["vma"]:
         PAGE,
         0,
         fields["data_offset"],
-        0x7,
+        fields["prot"],
         0x22,
         0,
         0,
@@ -211,6 +213,10 @@ refused_with short.ksnap "truncated" "a snapshot cut off after the header"
 
 # a missing file is a different path, but it must not crash either
 refused_with absent.ksnap "snapshot file" "a snapshot that is not there"
+
+# mprotect would refuse it only after the fork, with the payload already in
+write_snapshot "$WORK_DIR/badprot.ksnap" vma=1 prot=255
+refused_with badprot.ksnap "unknown protection" "a mapping with an unknown protection"
 
 # ------------------------------------------------------------------------------
 # A restore that fails after the fork must not release what it built
