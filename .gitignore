@@ -20,6 +20,9 @@ Ksnap-engine/test/*.txt
 # built by 'make test_programs', unlike the counter binaries which are
 # committed because the restore test depends on their exact layout
 Ksnap-engine/test_programs/threads
+Ksnap-engine/test_programs/fpu_rounding
+Ksnap-engine/test_programs/fpu_spin
+Ksnap-engine/test_programs/counter_dynamic_pie
 
 # skip all executable files
 *.elf
