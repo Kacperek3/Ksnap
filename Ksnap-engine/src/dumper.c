@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <linux/limits.h>
+#include <signal.h> // for kill
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -132,6 +133,24 @@ detach:
     free(xstate);
     free(vmas);
     free(path_pool);
+
+    // -k: the process is killed while it is still stopped by ptrace, so it
+    // never executes a single instruction past the state in the snapshot.
+    // Only a complete snapshot ends it, a failed dump releases it as usual.
+    if (result == OK && config.kill_after_dump) {
+        if (kill(config.pid, SIGKILL) == 0) {
+            // the tracer is told about the death too, collect that notice
+            waitpid(config.pid, &status, 0);
+            printf("Process %d terminated after the snapshot\n", config.pid);
+            return OK;
+        }
+
+        fprintf(stderr,
+                "Error: the snapshot is saved, but process %d could not be "
+                "terminated: %s\n",
+                config.pid, strerror(errno));
+        result = ERROR;
+    }
 
     // waking the process
     if (ptrace(PTRACE_DETACH, config.pid, NULL, NULL) == -1) {
@@ -467,6 +486,14 @@ static int write_snapshot(pid_t pid, const char *snapshot_path,
 cleanup:
     if (mem_file_handle != -1)
         close(mem_file_handle);
+
+    // a snapshot is only done once it is on the disk, not only in the page
+    // cache. With -k it is about to become the only copy of the process.
+    if (result == OK &&
+        (fflush(snapshot_handle) != 0 || fsync(fileno(snapshot_handle)) != 0)) {
+        perror("Error during flushing the snapshot file to disk");
+        result = ERROR;
+    }
 
     // buffered payload data only reaches the disk on fclose, so a failure
     // here still means an incomplete dump

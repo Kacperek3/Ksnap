@@ -26,7 +26,7 @@ build/%.o : src/%.c
 # their exact layout, so only the helpers that are not a dump target are built
 # here
 test_programs: test_programs/threads test_programs/fpu_rounding \
-	test_programs/fpu_spin
+	test_programs/fpu_spin test_programs/counter_dynamic_pie
 
 test_programs/threads: test_programs/threads.c
 	$(CC) -pthread -O0 -g $< -o $@
@@ -35,6 +35,11 @@ test_programs/threads: test_programs/threads.c
 test_programs/fpu_rounding: test_programs/fpu_rounding.c
 	$(CC) -static -no-pie -O0 -g $< -o $@ -lm
 
+# the same counter as counter_static_noPie, but dynamically linked and PIE, so
+# the binary, ld.so and libc all land at random addresses in the original
+test_programs/counter_dynamic_pie: test_programs/counter_static_noPie.c
+	$(CC) -fPIE -pie -O0 -g $< -o $@
+
 # -O2 keeps the accumulator in a register, -mavx makes that register a ymm one
 test_programs/fpu_spin: test_programs/fpu_spin.c
 	$(CC) -static -no-pie -O2 -mavx -g $< -o $@
@@ -42,6 +47,8 @@ test_programs/fpu_spin: test_programs/fpu_spin.c
 test: test_programs
 	test/./test_restore_validation.sh
 	test/./test_static_noPie.sh
+	test/./test_dynamic_pie.sh
+	test/./test_dump_kill.sh
 	test/./test_check.sh
 	test/./test_fpu.sh
 

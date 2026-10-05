@@ -26,7 +26,8 @@ typedef enum ksnap_status_t {
     KSNAP_ERR_INVALID_NAME = -5,
     KSNAP_ERR_MISSING_ARGS = -6,
     KSNAP_ERR_TOO_MUCH_ARGS = -7,
-    KSNAP_ERR_INVALID_ARGS = -8
+    KSNAP_ERR_INVALID_ARGS = -8,
+    KSNAP_ERR_KILL_WITHOUT_DUMP = -9
 } ksnap_status_t;
 
 #define LIST_OF_MODES                                                          \
@@ -72,13 +73,14 @@ static inline ksnap_status_t parse_arg(int argc, char **argv,
     config->pid = -1;
     config->file_name = NULL;
     config->output_dir = NULL;
+    config->kill_after_dump = false;
 
     int opt;
     int pid;
     modes_t mode;
     ksnap_status_t status = KSNAP_ERR_MISSING_ARGS;
 
-    while ((opt = getopt(argc, argv, "m:p:n:d:h")) != -1) {
+    while ((opt = getopt(argc, argv, "m:p:n:d:kh")) != -1) {
         switch (opt) {
         case 'm':
             status = validate_mode(optarg, &mode);
@@ -112,6 +114,10 @@ static inline ksnap_status_t parse_arg(int argc, char **argv,
             printf("  -n <name>    Target file name for saving/restoring "
                    "memory\n");
             printf("  -d <path>    Directory path for output/input files\n");
+            printf("  -k           Dump only: terminate the process once the "
+                   "snapshot\n");
+            printf("               is written, it never runs past the "
+                   "snapshot\n");
             printf("  -h           Show this help message and exit\n\n");
             printf("Check mode reports, as one JSON object per line, "
                    "whether a process\n");
@@ -121,6 +127,7 @@ static inline ksnap_status_t parse_arg(int argc, char **argv,
             printf("Examples:\n");
             printf("  sudo ./Ksnap -m Dump -p 1234 -n memory_dump -d "
                    "/tmp/ksnap\n");
+            printf("  sudo ./Ksnap -m Dump -p 1234 -k\n");
             printf("  sudo ./Ksnap -m Check -p 1234\n");
             printf("  sudo ./Ksnap -m Check\n");
             // nothing else makes sense after the usage was asked for
@@ -134,6 +141,10 @@ static inline ksnap_status_t parse_arg(int argc, char **argv,
 
             set_config_file_name(config, optarg);
 
+            break;
+
+        case 'k':
+            config->kill_after_dump = true;
             break;
 
         case 'd':
@@ -245,6 +256,15 @@ static inline ksnap_status_t validate_mandatory_args(ksnap_config_t *config) {
         return status;
     }
 
+    // ending a process is only ever the second half of a dump, a Restore or a
+    // Check with -k would end nothing, and silently ignoring it would hide a
+    // mistake in the caller
+    if (config->kill_after_dump &&
+        strncmp(config->mode, "DUMP", DUMP_LEN) != 0) {
+        status = KSNAP_ERR_KILL_WITHOUT_DUMP;
+        return status;
+    }
+
     return KSNAP_OK;
 }
 
@@ -275,6 +295,9 @@ static inline bool check_status(ksnap_status_t *status) {
         break;
     case KSNAP_ERR_INVALID_ARGS:
         fprintf(stderr, "Invalid args \n");
+        break;
+    case KSNAP_ERR_KILL_WITHOUT_DUMP:
+        fprintf(stderr, "-k can only be used with Dump\n");
         break;
     }
     return ERROR;

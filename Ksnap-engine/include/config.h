@@ -2,6 +2,7 @@
 #define CONFIG_H
 
 #include <linux/limits.h>
+#include <stdbool.h>
 #include <stdio.h>
 
 // --------------------------
@@ -24,6 +25,7 @@ typedef struct {
     int pid;
     char *file_name;
     char *output_dir;
+    bool kill_after_dump; // -k, the process ends with the snapshot
 } ksnap_config_t;
 
 // join the directory and the file name of the snapshot into one path

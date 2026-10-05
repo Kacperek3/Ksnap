@@ -1,4 +1,12 @@
 #!/bin/bash
+#
+# Dump a running counter, kill it, restore it and check that it continues from
+# the right value with the same memory protections.
+#
+# Usage: test_static_noPie.sh [program]
+#
+# Without an argument the static non-PIE counter is used. test_dynamic_pie.sh
+# passes a dynamically linked PIE build of the same counter.
 
 set -uo pipefail
 
@@ -11,7 +19,7 @@ ENGINE_DIR="$(dirname "$TEST_DIR")"
 PROGRAMS_DIR="$ENGINE_DIR/test_programs"
 
 KSNAP="$ENGINE_DIR/build/Ksnap"
-PROGRAM="$PROGRAMS_DIR/counter_static_noPie"
+PROGRAM="${1:-$PROGRAMS_DIR/counter_static_noPie}"
 
 DUMP_LOG="$TEST_DIR/logs.txt"
 RESTORE_LOG="$TEST_DIR/restore_logs.txt"
@@ -59,7 +67,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "Starting tests"
+echo "Starting tests on $(basename "$PROGRAM")"
 
 [ -x "$KSNAP" ] || fail "$KSNAP not found, run 'make' first"
 [ -x "$PROGRAM" ] || fail "$PROGRAM not found"

@@ -360,8 +360,10 @@ static void scan_maps(pid_t pid, check_report_t *report) {
 
     if (report->shared_vmas > 0)
         add_reason(report, "shared_mapping",
-                   "%u shared mapping(s) would be dropped silently, first %s",
-                   report->shared_vmas, first_shared);
+                   "%u shared %s would be dropped silently, first %s",
+                   report->shared_vmas,
+                   report->shared_vmas == 1 ? "mapping" : "mappings",
+                   first_shared);
 
     if (report->device_vmas > 0)
         add_reason(report, "device_mapping",
