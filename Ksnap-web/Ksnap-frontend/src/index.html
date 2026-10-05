@@ -68,7 +68,7 @@
                 </tbody>
               </table>
             </div>
-            <div class="card-footer text-secondary small" id="process-summary"></div>
+            <div class="card-footer small process-summary" id="process-summary"></div>
           </div>
         </section>
 
@@ -135,7 +135,17 @@
             <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
           </div>
           <div class="modal-body">
-            <p class="text-secondary small mb-3" id="dump-target"></p>
+            <div class="dump-target mb-3">
+              <div class="d-flex align-items-baseline gap-2">
+                <span class="fw-semibold text-truncate" id="dump-target-name"></span>
+                <span class="text-secondary small ms-auto text-nowrap" id="dump-target-pid"></span>
+              </div>
+              <div class="dump-target-command" id="dump-target-command"></div>
+              <div class="dump-target-size" id="dump-target-size-row">
+                <span class="text-secondary">Estimated snapshot size</span>
+                <span class="fw-semibold" id="dump-target-size"></span>
+              </div>
+            </div>
             <label class="form-label" for="dump-name">Snapshot name</label>
             <input
               class="form-control"
@@ -143,14 +153,25 @@
               pattern="[A-Za-z0-9._-]{1,64}"
               required
             />
-            <div class="form-text">
-              Letters, digits, dot, dash and underscore. The engine is invoked as
-              <code>-d &lt;snapshot dir&gt; -n &lt;name&gt;</code>.
+            <label class="form-label mt-3" for="dump-directory">Folder</label>
+            <input
+              class="form-control font-monospace"
+              id="dump-directory"
+              list="dump-directory-options"
+              autocomplete="off"
+              spellcheck="false"
+              required
+            />
+            <datalist id="dump-directory-options"></datalist>
+            <div class="form-check mt-3">
+              <input class="form-check-input" type="checkbox" id="dump-kill" />
+              <label class="form-check-label" for="dump-kill">
+                Terminate the process after the snapshot
+              </label>
             </div>
-            <div class="alert alert-warning mt-3 mb-0 py-2 small d-none" id="dump-warning">
-              The snapshot can be taken, but the restored process will not be
-              identical:
-              <ul class="mb-0 mt-1" id="dump-warning-list"></ul>
+            <div class="dump-caveats d-none" id="dump-warning">
+              <div class="dump-caveats-title">Restore limitations</div>
+              <ul class="dump-caveats-list" id="dump-warning-list"></ul>
             </div>
           </div>
           <div class="modal-footer">
@@ -160,6 +181,33 @@
             <button type="submit" class="btn btn-primary" id="dump-submit">Snapshot</button>
           </div>
         </form>
+      </div>
+    </div>
+
+    <div class="modal fade" id="delete-modal" tabindex="-1">
+      <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h5 class="modal-title">Delete snapshot</h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+          </div>
+          <div class="modal-body">
+            <div class="dump-target">
+              <div class="d-flex align-items-baseline gap-2">
+                <span class="fw-semibold font-monospace text-truncate" id="delete-name"></span>
+                <span class="text-secondary small ms-auto text-nowrap" id="delete-size"></span>
+              </div>
+              <div class="dump-target-command dump-target-path" id="delete-directory"></div>
+            </div>
+            <p class="text-secondary small mt-3 mb-0">This cannot be undone.</p>
+          </div>
+          <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">
+              Cancel
+            </button>
+            <button type="button" class="btn btn-danger" id="delete-submit">Delete</button>
+          </div>
+        </div>
       </div>
     </div>
 

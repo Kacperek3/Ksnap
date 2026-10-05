@@ -8,7 +8,7 @@ that API.
 browser (HTML5 + Bootstrap 5 + vanilla JS)
     |  fetch(/api/...)
 Flask API  (Ksnap-backend/src)
-    |  subprocess: Ksnap -m Dump|Restore -p <pid> -d <dir> -n <name>
+    |  subprocess: Ksnap -m Dump|Restore -p <pid> -d <dir> -n <name> [-k]
 Ksnap engine (C, ptrace + /proc)
 ```
 
@@ -49,7 +49,8 @@ Open <http://127.0.0.1:5000>.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `KSNAP_ENGINE` | `Ksnap-engine/build/Ksnap` | path to the engine binary |
-| `KSNAP_SNAPSHOT_DIR` | `Ksnap-engine/save` | snapshot store (`-d` of the engine) |
+| `KSNAP_SNAPSHOT_DIR` | `Ksnap-engine/save` | default snapshot store (`-d` of the engine) |
+| `KSNAP_DIRECTORIES_FILE` | `<snapshot store>/directories.json` | other folders a dump was written to |
 | `KSNAP_SUDO` | `auto` | `auto` = sudo unless already root, `1` = always, `0` = never |
 | `KSNAP_HOST` / `KSNAP_PORT` | `127.0.0.1` / `5000` | where the panel listens |
 | `KSNAP_DUMP_TIMEOUT` | `60` | seconds before a dump is abandoned |
@@ -63,16 +64,22 @@ Open <http://127.0.0.1:5000>.
 | --- | --- | --- |
 | `GET` | `/api/status` | engine availability, privilege mode, restore session |
 | `GET` | `/api/processes?query=&all=` | processes with the engine's verdict, see Eligibility |
-| `GET` | `/api/snapshots` | snapshot store with parsed headers |
-| `DELETE` | `/api/snapshots/<name>` | remove one snapshot |
-| `POST` | `/api/dump` | `{"pid": 1234, "name": "counter-1234"}` |
-| `POST` | `/api/restore` | `{"name": "counter-1234.ksnap"}` |
+| `GET` | `/api/snapshots` | snapshots of every known folder with parsed headers, each with its `directory`, plus `directories` |
+| `DELETE` | `/api/snapshots/<name>?directory=<folder>` | remove one snapshot |
+| `POST` | `/api/dump` | `{"pid": 1234, "name": "counter-1234", "directory": "/data/ksnap", "kill": false}`, `kill: true` ends the process with the snapshot (`-k`) |
+| `POST` | `/api/restore` | `{"name": "counter-1234.ksnap", "directory": "/data/ksnap"}` |
 | `POST` | `/api/restore/stop` | terminate the running restored process |
 | `GET` | `/api/logs?since=<seq>` | console feed since a sequence number |
 | `DELETE` | `/api/logs` | clear the console |
 
 Errors are always `{"error": "..."}`: `400` for a rejected argument, `404` for a
 missing snapshot, `409` when the engine cannot do it right now.
+
+A dump can go to any absolute folder, which is created when it is missing. The
+default store and every folder a dump was written to are remembered in
+`KSNAP_DIRECTORIES_FILE`, and restore and delete only accept those folders, so
+the API never touches a folder it did not write to itself. Leaving `directory`
+out means the default store.
 
 The name given to `-n` is validated (`[A-Za-z0-9._-]{1,64}` plus a containment
 check against the snapshot directory) and every call is executed as an argument
@@ -167,8 +174,8 @@ The engine reports these through Check rather than discovering them mid dump:
   restored (`open_files`, `has_children`)
 * a restored process is started from the snapshot's own executable path, with
   no command line arguments (`arguments_not_restored`)
-* floating point and vector registers are not part of the snapshot, so a
-  process in the middle of such a computation is not an honest candidate even
-  when it is reported as `ok`
 * a snapshot only restores on the kernel it was taken on, because the vdso has
-  to match
+  to match, and on a CPU with the same extended features (AVX, AVX-512, ...),
+  because the FPU/SSE/AVX state is stored as the XSAVE area of the dumping CPU
+* snapshots taken before format version 3 (no FPU/SSE/AVX state) are listed
+  with an error and cannot be restored, they have to be taken again

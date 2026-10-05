@@ -6,6 +6,7 @@ Run it with:   python3 src/app.py
 from flask import Flask, jsonify, request, send_from_directory
 
 import config
+import directories
 import eligibility
 import engine
 import logbook as logbook_module
@@ -71,23 +72,41 @@ def create_app():
 
     @app.get("/api/snapshots")
     def list_snapshots():
+        folders = directories.known()
+        snapshots = []
+        for folder in folders:
+            snapshots += snapshot_module.list_snapshots(folder)
+        snapshots.sort(key=lambda item: item.get("created_at") or "", reverse=True)
+
         return jsonify(
             {
-                "snapshots": snapshot_module.list_snapshots(config.SNAPSHOT_DIR),
-                "directory": str(config.SNAPSHOT_DIR),
+                "snapshots": snapshots,
+                # the default store, where a dump goes when no folder is given
+                "directory": str(folders[0]),
+                "directories": [str(folder) for folder in folders],
             }
         )
 
     @app.delete("/api/snapshots/<name>")
     def delete_snapshot(name):
-        snapshot_module.delete(config.SNAPSHOT_DIR, name)
-        engine.logbook.append("Snapshot %s deleted" % name, source="api")
-        return jsonify({"deleted": name})
+        folder = directories.require_known(request.args.get("directory"))
+        snapshot_module.delete(folder, name)
+        engine.logbook.append(
+            "Snapshot %s deleted from %s" % (name, folder), source="api"
+        )
+        return jsonify({"deleted": name, "directory": str(folder)})
 
     @app.post("/api/dump")
     def dump():
         payload = request.get_json(silent=True) or {}
         pid = processes.validate_pid(payload.get("pid"))
+        # ending a process is not something a truthy string should trigger
+        kill = payload.get("kill", False)
+        if not isinstance(kill, bool):
+            raise ValueError("'kill' must be true or false")
+        # an empty folder means the default store
+        folder = payload.get("directory")
+        folder = directories.validate(folder) if folder else None
         # the engine decides, including its ptrace probe, so the API is not
         # merely decorated by the GUI
         verdict = eligibility.require_dumpable(pid)
@@ -100,7 +119,7 @@ def create_app():
                 "pid %d: %s" % (pid, caveat), source="eligibility"
             )
 
-        return jsonify({"snapshot": engine.dump(pid, name)})
+        return jsonify({"snapshot": engine.dump(pid, name, kill=kill, directory=folder), "killed": kill})
 
     @app.post("/api/restore")
     def restore():
@@ -108,7 +127,8 @@ def create_app():
         name = payload.get("name")
         if not name:
             raise ValueError("snapshot name is required")
-        return jsonify({"restore": engine.restore(name)})
+        folder = directories.require_known(payload.get("directory"))
+        return jsonify({"restore": engine.restore(name, directory=folder)})
 
     @app.post("/api/restore/stop")
     def stop_restore():

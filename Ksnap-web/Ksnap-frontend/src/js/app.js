@@ -16,6 +16,12 @@ const state = {
   selectedPid: null,
   logCursor: 0,
   restoreRunning: false,
+  // the default store and every folder a dump was written to
+  directories: [],
+  // where the last dump went, offered again in the next one
+  lastDirectory: null,
+  // the snapshot the delete dialog is asking about
+  pendingDelete: null,
 };
 
 // how a verdict from the backend is shown in the Status column
@@ -27,6 +33,7 @@ const LEVELS = {
 };
 
 const dumpModal = new bootstrap.Modal("#dump-modal");
+const deleteModal = new bootstrap.Modal("#delete-modal");
 const element = (id) => document.getElementById(id);
 
 /* ---------------------------------------------------------------- helpers */
@@ -80,6 +87,12 @@ function badge(row, level, reasons) {
   td.title = reasons.map((reason) => reason.message).join("\n") || "the engine handles this process";
   td.appendChild(span);
   return td;
+}
+
+// .exe-path cuts long paths on the left with direction: rtl, the marks keep the
+// leading "/" where it belongs instead of letting the bidi rules move it
+function pathText(path) {
+  return `\u200e${path}\u200e`;
 }
 
 function placeholder(tbody, columns, text) {
@@ -175,15 +188,38 @@ function renderProcesses(processes) {
   renderProcessSummary();
 }
 
+// one colored dot, a count and a label per verdict, the kernel threads that
+// are left out of the list sit apart on the right
 function renderProcessSummary() {
-  const { ok, risky, blocked, unknown } = state.counts;
-  const skipped = state.kernelThreads
-    ? `, ${state.kernelThreads} kernel thread(s) skipped`
-    : "";
-  const unchecked = unknown ? `, ${unknown} not checked` : "";
-  element("process-summary").textContent =
-    `${ok} restorable, ${risky} partial, ${blocked} not restorable` +
-    `${unchecked}${skipped}`;
+  const footer = element("process-summary");
+  footer.innerHTML = "";
+
+  for (const level of ["ok", "risky", "blocked", "unknown"]) {
+    const count = state.counts[level] || 0;
+    if (level === "unknown" && !count) continue;
+
+    const item = document.createElement("span");
+    item.className = "summary-item";
+    const dot = document.createElement("span");
+    dot.className = `summary-dot ${LEVELS[level].className.replace("text-bg-", "bg-")}`;
+    const number = document.createElement("span");
+    number.className = "fw-semibold";
+    number.textContent = count;
+    const label = document.createElement("span");
+    label.className = "text-secondary";
+    label.textContent = LEVELS[level].label;
+    item.append(dot, number, label);
+    footer.appendChild(item);
+  }
+
+  if (state.kernelThreads) {
+    const hidden = document.createElement("span");
+    hidden.className = "text-secondary ms-auto";
+    hidden.textContent = `${state.kernelThreads} kernel ${
+      state.kernelThreads === 1 ? "thread" : "threads"
+    } hidden`;
+    footer.appendChild(hidden);
+  }
 }
 
 function selectProcess(pid) {
@@ -215,8 +251,11 @@ async function refreshProcesses() {
 
 /* -------------------------------------------------------------- snapshots */
 
-function renderSnapshots(snapshots, directory) {
-  element("snapshot-dir").textContent = directory;
+function renderSnapshots(snapshots, directories) {
+  const footer = element("snapshot-dir");
+  footer.textContent =
+    directories.length === 1 ? directories[0] : `${directories.length} folders`;
+  footer.title = directories.join("\n");
   const tbody = element("snapshot-rows");
 
   if (!snapshots.length) {
@@ -225,72 +264,124 @@ function renderSnapshots(snapshots, directory) {
   }
 
   tbody.innerHTML = "";
-  for (const snapshot of snapshots) {
-    const row = tbody.insertRow();
-    const name = cell(row, snapshot.name, "font-monospace");
-    name.title = `created ${formatTime(snapshot.created_at)}`;
+  // with one folder the table stays flat, with more each folder gets a header
+  const grouped = directories.length > 1;
+  for (const directory of directories) {
+    const inFolder = snapshots.filter((snapshot) => snapshot.directory === directory);
+    if (!inFolder.length) continue;
 
-    if (snapshot.error) {
-      const problem = cell(row, snapshot.error, "text-danger small");
-      problem.colSpan = 2;
-    } else {
-      const executable = row.insertCell();
+    if (grouped) {
+      const header = tbody.insertRow();
+      header.className = "snapshot-group";
+      const td = header.insertCell();
+      td.colSpan = 5;
       const path = document.createElement("span");
-      path.className = "exe-path";
-      path.textContent = snapshot.exe_path;
-      path.title = `${snapshot.exe_path}\nRIP ${snapshot.rip}  RSP ${snapshot.rsp}`;
-      executable.appendChild(path);
-      cell(row, snapshot.vma_count, "text-end");
+      path.className = "exe-path snapshot-group-path";
+      path.textContent = pathText(directory);
+      path.title = directory;
+      td.appendChild(path);
     }
 
-    cell(row, formatSize(snapshot.size), "text-end");
-
-    const actions = row.insertCell();
-    actions.className = "text-end text-nowrap";
-
-    if (!snapshot.error) {
-      const restore = document.createElement("button");
-      restore.className = "btn btn-sm btn-success me-1";
-      restore.textContent = "Restore";
-      restore.dataset.restoreButton = "true";
-      restore.disabled = state.restoreRunning;
-      restore.addEventListener("click", () => restoreSnapshot(snapshot.name));
-      actions.appendChild(restore);
-    }
-
-    const remove = document.createElement("button");
-    remove.className = "btn btn-sm btn-outline-danger";
-    remove.textContent = "Delete";
-    remove.addEventListener("click", () => deleteSnapshot(snapshot.name));
-    actions.appendChild(remove);
+    for (const snapshot of inFolder) renderSnapshotRow(tbody, snapshot);
   }
+}
+
+function renderSnapshotRow(tbody, snapshot) {
+  const row = tbody.insertRow();
+  const name = cell(row, snapshot.name, "font-monospace");
+  name.title = `created ${formatTime(snapshot.created_at)}`;
+
+  if (snapshot.error) {
+    const problem = cell(row, snapshot.error, "text-danger small");
+    problem.colSpan = 2;
+  } else {
+    const executable = row.insertCell();
+    const path = document.createElement("span");
+    path.className = "exe-path";
+    path.textContent = pathText(snapshot.exe_path);
+    path.title =
+      `${snapshot.exe_path}\nRIP ${snapshot.rip}  RSP ${snapshot.rsp}` +
+      `\nFPU/SSE/AVX state ${snapshot.xstate_size} B`;
+    executable.appendChild(path);
+    cell(row, snapshot.vma_count, "text-end");
+  }
+
+  cell(row, formatSize(snapshot.size), "text-end text-nowrap");
+
+  const actions = row.insertCell();
+  actions.className = "text-end text-nowrap";
+
+  if (!snapshot.error) {
+    const restore = document.createElement("button");
+    restore.className = "btn btn-sm btn-success me-1";
+    restore.textContent = "Restore";
+    restore.dataset.restoreButton = "true";
+    restore.disabled = state.restoreRunning;
+    restore.addEventListener("click", () =>
+      restoreSnapshot(snapshot.name, snapshot.directory),
+    );
+    actions.appendChild(restore);
+  }
+
+  const remove = document.createElement("button");
+  remove.className = "btn btn-sm btn-outline-danger";
+  remove.textContent = "Delete";
+  remove.addEventListener("click", () =>
+    openDeleteModal(snapshot),
+  );
+  actions.appendChild(remove);
 }
 
 async function refreshSnapshots() {
   try {
     const payload = await api("/api/snapshots");
-    renderSnapshots(payload.snapshots, payload.directory);
+    state.directories = payload.directories;
+    renderSnapshots(payload.snapshots, payload.directories);
   } catch (error) {
     showError(error);
   }
 }
 
-async function restoreSnapshot(name) {
+async function restoreSnapshot(name, directory) {
   try {
-    await api("/api/restore", { method: "POST", body: JSON.stringify({ name }) });
+    await api("/api/restore", {
+      method: "POST",
+      body: JSON.stringify({ name, directory }),
+    });
     await refreshStatus();
   } catch (error) {
     showError(error);
   }
 }
 
-async function deleteSnapshot(name) {
-  if (!confirm(`Delete snapshot ${name}?`)) return;
+function openDeleteModal(snapshot) {
+  state.pendingDelete = snapshot;
+  element("delete-name").textContent = snapshot.name;
+  element("delete-size").textContent = formatSize(snapshot.size);
+  const directory = element("delete-directory");
+  directory.textContent = pathText(snapshot.directory || "");
+  directory.title = snapshot.directory || "";
+  deleteModal.show();
+}
+
+async function deleteSnapshot() {
+  const snapshot = state.pendingDelete;
+  if (!snapshot) return;
+
+  const button = element("delete-submit");
+  button.disabled = true;
   try {
-    await api(`/api/snapshots/${encodeURIComponent(name)}`, { method: "DELETE" });
+    const name = encodeURIComponent(snapshot.name);
+    const folder = encodeURIComponent(snapshot.directory || "");
+    await api(`/api/snapshots/${name}?directory=${folder}`, { method: "DELETE" });
+    // cleared only on success, after a failure the dialog stays usable
+    state.pendingDelete = null;
+    deleteModal.hide();
     await refreshSnapshots();
   } catch (error) {
     showError(error);
+  } finally {
+    button.disabled = false;
   }
 }
 
@@ -301,9 +392,14 @@ function openDumpModal() {
   if (!process) return;
 
   const bytes = (process.eligibility.facts || {}).snapshot_bytes;
-  const size = bytes ? ` | snapshot about ${formatSize(bytes)}` : "";
-  element("dump-target").textContent =
-    `${process.name} (pid ${process.pid}): ${process.cmdline}${size}`;
+  element("dump-target-name").textContent = process.name;
+  element("dump-target-pid").textContent = `PID ${process.pid}`;
+  const command = element("dump-target-command");
+  command.textContent = process.cmdline;
+  command.title = process.cmdline;
+  command.classList.toggle("d-none", !process.cmdline);
+  element("dump-target-size").textContent = bytes ? formatSize(bytes) : "";
+  element("dump-target-size-row").classList.toggle("d-none", !bytes);
   element("dump-name").value = `${process.name}-${process.pid}`.replace(
     /[^A-Za-z0-9._-]/g,
     "-",
@@ -314,17 +410,81 @@ function openDumpModal() {
   const list = element("dump-warning-list");
   list.innerHTML = "";
   for (const caveat of caveats) {
+    const { title, detail } = describeCaveat(caveat, process.eligibility.facts || {});
     const item = document.createElement("li");
-    item.textContent = caveat.message;
+    const name = document.createElement("div");
+    name.className = "dump-caveat-title";
+    name.textContent = title;
+    const text = document.createElement("div");
+    text.className = "dump-caveat-detail";
+    text.textContent = detail;
+    item.append(name, text);
     list.appendChild(item);
   }
   element("dump-warning").classList.toggle("d-none", caveats.length === 0);
+  element("dump-directory").value = state.lastDirectory || state.directories[0] || "";
+  const options = element("dump-directory-options");
+  options.innerHTML = "";
+  for (const directory of state.directories) {
+    const option = document.createElement("option");
+    option.value = directory;
+    options.appendChild(option);
+  }
+  // ending a process is never remembered from the previous dump
+  element("dump-kill").checked = false;
+  updateDumpSubmit();
   dumpModal.show();
+}
+
+function plural(count, singular, pluralForm) {
+  return `${count} ${count === 1 ? singular : pluralForm}`;
+}
+
+// a short title and one line of detail per caveat, built from the facts where
+// the panel knows them, the backend message is the fallback for the rest
+function describeCaveat(caveat, facts) {
+  switch (caveat.code) {
+    case "arguments_not_restored":
+      return { title: "Command line arguments", detail: "The process restarts without them" };
+    case "open_files": {
+      const volatile = facts.volatile_fds || 0;
+      const files = (facts.open_fds || 0) - volatile;
+      const parts = [];
+      if (volatile) parts.push(plural(volatile, "socket or pipe", "sockets or pipes"));
+      if (files > 0) parts.push(plural(files, "file", "files"));
+      return { title: "Open descriptors", detail: parts.join(", ") || caveat.message };
+    }
+    case "has_children":
+      return {
+        title: "Child processes",
+        detail: plural(facts.children || 0, "child process", "child processes"),
+      };
+    case "large_snapshot":
+      return { title: "Large snapshot", detail: capitalize(caveat.message) };
+    case "path_with_space":
+      return { title: "Executable path", detail: "Contains a space, which the engine truncates" };
+    default:
+      return { title: capitalize(caveat.code.replace(/_/g, " ")), detail: capitalize(caveat.message) };
+  }
+}
+
+function capitalize(text) {
+  return text ? text[0].toUpperCase() + text.slice(1) : text;
+}
+
+function updateDumpSubmit() {
+  const kill = element("dump-kill").checked;
+  const button = element("dump-submit");
+  button.textContent = kill ? "Snapshot and terminate" : "Snapshot";
+  button.classList.toggle("btn-primary", !kill);
+  button.classList.toggle("btn-danger", kill);
 }
 
 async function submitDump(event) {
   event.preventDefault();
   const button = element("dump-submit");
+  const kill = element("dump-kill").checked;
+  const directory = element("dump-directory").value.trim();
   button.disabled = true;
   try {
     await api("/api/dump", {
@@ -332,10 +492,15 @@ async function submitDump(event) {
       body: JSON.stringify({
         pid: state.selectedPid,
         name: element("dump-name").value.trim(),
+        directory,
+        kill,
       }),
     });
+    state.lastDirectory = directory;
     dumpModal.hide();
     await refreshSnapshots();
+    // the process is gone, the list must not offer it any more
+    if (kill) await refreshProcesses();
   } catch (error) {
     showError(error);
   } finally {
@@ -403,6 +568,8 @@ function bind() {
   element("btn-refresh-snapshots").addEventListener("click", refreshSnapshots);
   element("btn-dump").addEventListener("click", openDumpModal);
   element("dump-form").addEventListener("submit", submitDump);
+  element("dump-kill").addEventListener("change", updateDumpSubmit);
+  element("delete-submit").addEventListener("click", deleteSnapshot);
   element("btn-clear-logs").addEventListener("click", clearLogs);
   element("btn-stop").addEventListener("click", async () => {
     try {

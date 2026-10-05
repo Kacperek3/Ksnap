@@ -157,8 +157,8 @@ class VerdictTest(unittest.TestCase):
         verdict = eligibility.verdict_from_report(report(open_fds=3, volatile_fds=2))
         message = verdict["reasons"][0]["message"]
         self.assertEqual(verdict["level"], eligibility.RISKY)
-        self.assertIn("2 socket(s) or pipe(s)", message)
-        self.assertIn("1 open file(s)", message)
+        self.assertIn("2 sockets or pipes", message)
+        self.assertIn("1 open file ", message)
 
     def test_children_are_risky(self):
         verdict = eligibility.verdict_from_report(report(children=2))

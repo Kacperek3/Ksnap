@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 MAGIC = b"KSNAPDMP"
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3
 
 MAX_KERNEL_MAPS = 4
 KERNEL_MAP_NAME_LEN = 32
@@ -20,13 +20,15 @@ PATH_MAX = 4096
 # ksnap_dump_header_t, x86_64 layout:
 #   magic[8], version, vma_count, vma_table_offset, path_pool_offset,
 #   path_pool_size, data_offset, exe_path_len, exe_path[PATH_MAX],
-#   kernel_map_count, kernel_maps[4], regs
+#   kernel_map_count, kernel_maps[4], regs, xstate_offset, xstate_size,
+#   xstate_reserved
 _KERNEL_MAP_FORMAT = "QQ32s"
 _REGS_COUNT = 27  # struct user_regs_struct on x86_64
 HEADER_FORMAT = (
     "<8sIIQQQQI%dsI" % PATH_MAX
     + _KERNEL_MAP_FORMAT * MAX_KERNEL_MAPS
     + "%dQ" % _REGS_COUNT
+    + "QII"
 )
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 
@@ -111,7 +113,9 @@ def read_header(path):
             }
         )
 
-    regs = fields[10 + MAX_KERNEL_MAPS * 3 :]
+    regs_start = 10 + MAX_KERNEL_MAPS * 3
+    regs = fields[regs_start : regs_start + _REGS_COUNT]
+    xstate_size = fields[regs_start + _REGS_COUNT + 1]
     stat = path.stat()
 
     return {
@@ -126,6 +130,7 @@ def read_header(path):
         "kernel_maps": kernel_maps,
         "rip": "0x%x" % regs[_RIP],
         "rsp": "0x%x" % regs[_RSP],
+        "xstate_size": xstate_size,
     }
 
 
@@ -142,7 +147,9 @@ def list_snapshots(directory):
     snapshots = []
     for path in sorted(directory.glob("*" + SUFFIX)):
         try:
-            snapshots.append(read_header(path))
+            header = read_header(path)
+            header["directory"] = str(directory)
+            snapshots.append(header)
         except (SnapshotError, OSError, struct.error) as error:
             stat = path.stat() if path.exists() else None
             snapshots.append(
@@ -155,6 +162,7 @@ def list_snapshots(directory):
                     if stat
                     else None,
                     "error": str(error),
+                    "directory": str(directory),
                 }
             )
 

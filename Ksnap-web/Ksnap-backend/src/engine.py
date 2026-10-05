@@ -14,6 +14,7 @@ import threading
 from datetime import datetime, timezone
 
 import config
+import directories
 import logbook as logbook_module
 import snapshot as snapshot_module
 
@@ -142,14 +143,28 @@ def check(pid=None):
     return reports
 
 
-def dump(pid, name):
-    """Snapshot *pid* into <snapshot dir>/<name>, synchronously."""
-    name = snapshot_module.validate_name(name)
-    argv = _command(
-        [_binary(), "-m", "Dump", "-p", str(pid), "-d", _snapshot_dir(), "-n", name]
-    )
+def dump(pid, name, kill=False, directory=None):
+    """Snapshot *pid* into <directory>/<name>, synchronously.
 
-    logbook.append("Dump of pid %d into %s" % (pid, name), source="dump")
+    *directory* is a folder already checked by directories.validate, the
+    default store when it is None.
+
+    With *kill* the engine ends the process once the snapshot is on disk
+    ('-k'), and it does so while the process is still stopped, so nothing runs
+    past the saved state. A failed dump leaves the process running.
+    """
+    name = snapshot_module.validate_name(name)
+    directory = str(directory) if directory else _snapshot_dir()
+    command = [_binary(), "-m", "Dump", "-p", str(pid), "-d", directory, "-n", name]
+    if kill:
+        command.append("-k")
+    argv = _command(command)
+
+    logbook.append(
+        "Dump of pid %d into %s%s"
+        % (pid, name, ", the process ends with it" if kill else ""),
+        source="dump",
+    )
 
     try:
         completed = subprocess.run(
@@ -178,9 +193,21 @@ def dump(pid, name):
         raise EngineError(message)
 
     logbook.append(
-        "Snapshot %s written" % name, level=logbook_module.SUCCESS, source="dump"
+        "Snapshot %s written to %s" % (name, directory),
+        level=logbook_module.SUCCESS,
+        source="dump",
     )
-    return snapshot_module.read_header(snapshot_module.resolve(_snapshot_dir(), name))
+    if not directories.remember(directory):
+        logbook.append(
+            "%s could not be remembered, its snapshots will not be listed"
+            % directory,
+            level=logbook_module.ERROR,
+            source="dump",
+        )
+
+    header = snapshot_module.read_header(snapshot_module.resolve(directory, name))
+    header["directory"] = directory
+    return header
 
 
 class RestoreSession:
@@ -234,10 +261,15 @@ def _stream_output(session):
         )
 
 
-def restore(name):
-    """Start a restore session, refusing to run two of them at once."""
+def restore(name, directory=None):
+    """Start a restore session, refusing to run two of them at once.
+
+    *directory* is a folder already checked by directories.require_known, the
+    default store when it is None.
+    """
     name = snapshot_module.validate_name(name)
-    path = snapshot_module.resolve(_snapshot_dir(), name)
+    directory = str(directory) if directory else _snapshot_dir()
+    path = snapshot_module.resolve(directory, name)
     if not path.is_file():
         raise EngineError("snapshot %s does not exist" % name)
 
@@ -249,7 +281,7 @@ def restore(name):
                 "first" % _session.name
             )
 
-        argv = _command([_binary(), "-m", "Restore", "-d", _snapshot_dir(), "-n", name])
+        argv = _command([_binary(), "-m", "Restore", "-d", directory, "-n", name])
         logbook.append("Restore of %s" % name, source="restore")
 
         try:
