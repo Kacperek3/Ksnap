@@ -25,10 +25,15 @@ jobs:
         working-directory: Ksnap-engine
         run: make CFLAGS="-g -Wall -Werror -Iinclude"
 
-      # the threads helper is generated, unlike the committed counter binaries
+      
       - name: Build the test helpers
         working-directory: Ksnap-engine
         run: make test_programs
+
+      # needs no root, and it is the fast deterministic one, so it runs first
+      - name: Refuse a damaged snapshot
+        working-directory: Ksnap-engine
+        run: test/test_restore_validation.sh
 
       # lets test_check.sh exercise its already_traced case instead of skipping it
       - name: Install strace
@@ -38,9 +43,25 @@ jobs:
         working-directory: Ksnap-engine
         run: test/test_static_noPie.sh
 
+      - name: Dump and restore a dynamically linked PIE process
+        working-directory: Ksnap-engine
+        run: test/test_dynamic_pie.sh
+
+      - name: Dump -k ends the process with the snapshot
+        working-directory: Ksnap-engine
+        run: test/test_dump_kill.sh
+
       - name: Check mode and the snapshot_bytes invariant
         working-directory: Ksnap-engine
         run: test/test_check.sh
+
+      - name: FPU/SSE/AVX state survives a restore
+        working-directory: Ksnap-engine
+        run: test/test_fpu.sh
+
+      - name: Open regular files survive a restore
+        working-directory: Ksnap-engine
+        run: test/test_fds.sh
 
       - name: Keep the engine logs when something fails
         if: failure()

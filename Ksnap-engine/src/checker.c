@@ -18,6 +18,7 @@
 #include "checker.h"
 #include "config.h"
 #include "dump_format.h"
+#include "fds.h"
 #include "maps.h"
 
 // a process cannot collect more than a handful of distinct problems
@@ -25,11 +26,6 @@
 
 #define COMM_LEN 64
 #define DETAIL_LEN 160
-
-// what readlink reports for a descriptor that has no file behind it
-#define FD_SOCKET "socket:"
-#define FD_PIPE "pipe:"
-#define FD_ANON "anon_inode:"
 
 // readlink appends this once the binary behind /proc/<pid>/exe is gone
 #define DELETED_SUFFIX " (deleted)"
@@ -48,6 +44,7 @@ typedef struct {
     int argc;
     int open_fds;     // descriptors besides 0, 1 and 2
     int volatile_fds; // of those, the ones with no file behind them
+    int dumpable_fds; // of those, the regular files the snapshot carries
     int children;
     uid_t uid;
     uint64_t rss_kb;
@@ -360,8 +357,10 @@ static void scan_maps(pid_t pid, check_report_t *report) {
 
     if (report->shared_vmas > 0)
         add_reason(report, "shared_mapping",
-                   "%u shared mapping(s) would be dropped silently, first %s",
-                   report->shared_vmas, first_shared);
+                   "%u shared %s would be dropped silently, first %s",
+                   report->shared_vmas,
+                   report->shared_vmas == 1 ? "mapping" : "mappings",
+                   first_shared);
 
     if (report->device_vmas > 0)
         add_reason(report, "device_mapping",
@@ -377,8 +376,10 @@ static void scan_maps(pid_t pid, check_report_t *report) {
                    "no mapping the engine would copy");
 }
 
-// descriptors are not part of the snapshot at all, so they are reported as
-// facts and the panel decides how much that matters
+// the same walk the dumper does, through the same classify_fd. Regular files
+// travel with the snapshot, the rest is lost on restore, which is not a reason
+// to refuse, so it is reported as facts and the panel decides how much that
+// matters
 static void scan_fds(pid_t pid, check_report_t *report) {
     char fd_path[64];
     snprintf(fd_path, sizeof(fd_path), "/proc/%d/fd", pid);
@@ -388,31 +389,25 @@ static void scan_fds(pid_t pid, check_report_t *report) {
         return; // not readable is not a verdict, the counts stay at zero
 
     struct dirent *entry;
+    char target[PATH_MAX];
+
     while ((entry = readdir(fd_handle)) != NULL) {
         if (!isdigit((unsigned char)entry->d_name[0]))
             continue;
 
+        fd_class_t fd_class = classify_fd(pid, atoi(entry->d_name), target);
+
         // the restored process inherits the stdio of the engine, which is what
         // the restore test relies on, so 0, 1 and 2 are not a loss
-        if (!strcmp(entry->d_name, "0") || !strcmp(entry->d_name, "1") ||
-            !strcmp(entry->d_name, "2"))
+        if (fd_class == FD_SKIP_STDIO)
             continue;
 
         report->open_fds++;
 
-        // read through the open directory, a descriptor name plus the path
-        // would not fit a fixed buffer in the general case
-        char target[PATH_MAX];
-        ssize_t len = readlinkat(dirfd(fd_handle), entry->d_name, target,
-                                 sizeof(target) - 1);
-        if (len < 0)
-            continue;
-        target[len] = '\0';
-
-        if (!strncmp(target, FD_SOCKET, sizeof(FD_SOCKET) - 1) ||
-            !strncmp(target, FD_PIPE, sizeof(FD_PIPE) - 1) ||
-            !strncmp(target, FD_ANON, sizeof(FD_ANON) - 1))
+        if (fd_class == FD_SKIP_VOLATILE)
             report->volatile_fds++;
+        else if (fd_class == FD_DUMP)
+            report->dumpable_fds++;
     }
 
     closedir(fd_handle);
@@ -493,6 +488,7 @@ static void print_report(const check_report_t *report) {
     print_json_string(report->exe_path);
     printf(",\"open_fds\":%d", report->open_fds);
     printf(",\"volatile_fds\":%d", report->volatile_fds);
+    printf(",\"dumpable_fds\":%d", report->dumpable_fds);
     printf(",\"children\":%d", report->children);
     printf(",\"dumpable_vmas\":%u", report->dumpable_vmas);
     printf(",\"kernel_maps\":%u", report->kernel_maps);

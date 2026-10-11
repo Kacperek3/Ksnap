@@ -36,7 +36,7 @@ different process", the other means "something is wrong with the setup".
 ## Output
 
 ```json
-{"pid":18064,"dumpable":true,"reasons":[],"facts":{"comm":"counter_static_","state":"S","threads":1,"tracer_pid":0,"uid":1000,"rss_kb":772,"argc":1,"exe":"/opt/counter","open_fds":0,"volatile_fds":0,"children":0,"dumpable_vmas":8,"kernel_maps":3,"shared_vmas":0,"device_vmas":0,"snapshot_bytes":1052672,"ptrace_probed":true,"ptrace_ok":true}}
+{"pid":18064,"dumpable":true,"reasons":[],"facts":{"comm":"counter_static_","state":"S","threads":1,"tracer_pid":0,"uid":1000,"rss_kb":772,"argc":1,"exe":"/opt/counter","open_fds":0,"volatile_fds":0,"dumpable_fds":0,"children":0,"dumpable_vmas":8,"kernel_maps":3,"shared_vmas":0,"device_vmas":0,"snapshot_bytes":1052672,"ptrace_probed":true,"ptrace_ok":true}}
 ```
 
 `dumpable` is `true` exactly when `reasons` is empty.
@@ -54,15 +54,24 @@ panel turns those into its own three levels (`Ksnap-web/Ksnap-backend/src/eligib
 | `exe` | `/proc/<pid>/exe`, with the ` (deleted)` suffix stripped |
 | `open_fds` | descriptors besides 0, 1 and 2 |
 | `volatile_fds` | of those, the ones behind `socket:`, `pipe:` or `anon_inode:` |
+| `dumpable_fds` | of those, the regular files the snapshot carries and the restore reopens, from `classify_fd` |
 | `children` | entries in `/proc/<pid>/task/<pid>/children` |
 | `dumpable_vmas`, `kernel_maps`, `shared_vmas`, `device_vmas` | mappings per class, from `classify_maps_line` |
 | `snapshot_bytes` | **what the payload of the snapshot would weigh**, the sum of the dumpable mappings |
 | `ptrace_probed`, `ptrace_ok` | whether the ptrace probe ran, and whether it worked |
 
 `snapshot_bytes` is the exact size the dump will write after the header, the
-descriptor table and the path pool, which is why
-`Ksnap-engine/test/test_check.sh` asserts it against a real dump. That
+descriptor tables, the path pool and the XSAVE area (FPU/SSE/AVX state), which
+is why `Ksnap-engine/test/test_check.sh` asserts it against a real dump. That
 assertion is what keeps Check and Dump from drifting apart.
+
+`dumpable_fds` is held to the same standard: `Ksnap-engine/test/test_fds.sh`
+asserts it against the `fd_count` the dump writes into the header.
+
+Descriptors never produce a reason. Whatever is not a dumpable regular file
+(a pipe, a socket, a device, a deleted file) is simply missing in the restored
+process, which is a risk to judge, not something the engine cannot do, so it is
+left to the panel: `open_fds - dumpable_fds` is what will be lost.
 
 ### reasons
 
@@ -110,3 +119,8 @@ intended order: the cheap answer for the list, the certain one at the gate.
 happens to one mapping. Both `collect_vmas` in `src/dumper.c` and `scan_maps`
 in `src/checker.c` go through it, so Check cannot disagree with Dump about
 which mappings matter.
+
+`classify_fd` in `src/fds.c` does the same for descriptors, for `collect_fds`
+in `src/dumper.c` and `scan_fds` in `src/checker.c`. A descriptor is dumpable
+when it is a regular file whose path, as `/proc/<pid>/fd` shows it, still leads
+to the very same inode: that path is all the restore has to reopen it by.

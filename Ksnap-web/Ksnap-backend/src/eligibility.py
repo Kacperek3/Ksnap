@@ -10,6 +10,11 @@ UNKNOWN = "unknown"
 _SEVERITY = {OK: 0, RISKY: 1, BLOCKED: 2}
 
 
+def _count(number, singular, plural):
+    """'1 open file', '3 open files', the panel shows these as sentences."""
+    return "%d %s" % (number, singular if number == 1 else plural)
+
+
 def _reason(code, level, message):
     return {"code": code, "level": level, "message": message}
 
@@ -31,18 +36,21 @@ def _caveats(facts):
         )
 
     volatile = facts.get("volatile_fds", 0)
-    extra = facts.get("open_fds", 0)
-    if extra:
+    lost = facts.get("open_fds", 0) - facts.get("dumpable_fds", 0)
+    if lost > 0:
         details = []
         if volatile:
-            details.append("%d socket(s) or pipe(s)" % volatile)
-        if extra - volatile > 0:
-            details.append("%d open file(s)" % (extra - volatile))
+            details.append(_count(volatile, "socket or pipe", "sockets or pipes"))
+        if lost - volatile > 0:
+            details.append(
+                _count(lost - volatile, "other descriptor", "other descriptors")
+            )
         reasons.append(
             _reason(
                 "open_files",
                 RISKY,
-                "the snapshot stores no descriptors, so %s are lost on restore"
+                "the snapshot reopens regular files only, so %s will be lost "
+                "on restore"
                 % " and ".join(details),
             )
         )
@@ -52,8 +60,11 @@ def _caveats(facts):
             _reason(
                 "has_children",
                 RISKY,
-                "the process has %d child process(es), which are neither "
-                "dumped nor restored" % facts["children"],
+                "the process has %s, which %s neither dumped nor restored"
+                % (
+                    _count(facts["children"], "child process", "child processes"),
+                    "is" if facts["children"] == 1 else "are",
+                ),
             )
         )
 

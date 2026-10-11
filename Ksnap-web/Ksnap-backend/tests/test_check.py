@@ -32,6 +32,7 @@ def report(pid=4321, dumpable=True, reasons=(), **facts):
         "exe": "/bin/counter",
         "open_fds": 0,
         "volatile_fds": 0,
+        "dumpable_fds": 0,
         "children": 0,
         "dumpable_vmas": 8,
         "kernel_maps": 3,
@@ -153,12 +154,33 @@ class VerdictTest(unittest.TestCase):
         self.assertEqual(verdict["level"], eligibility.RISKY)
         self.assertEqual(verdict["reasons"][0]["code"], "arguments_not_restored")
 
-    def test_open_descriptors_are_risky_and_counted(self):
+    def test_lost_descriptors_are_risky_and_counted(self):
         verdict = eligibility.verdict_from_report(report(open_fds=3, volatile_fds=2))
         message = verdict["reasons"][0]["message"]
         self.assertEqual(verdict["level"], eligibility.RISKY)
-        self.assertIn("2 socket(s) or pipe(s)", message)
-        self.assertIn("1 open file(s)", message)
+        self.assertEqual(verdict["reasons"][0]["code"], "open_files")
+        self.assertIn("2 sockets or pipes", message)
+        self.assertIn("1 other descriptor ", message)
+
+    def test_regular_files_travel_with_the_snapshot(self):
+        verdict = eligibility.verdict_from_report(report(open_fds=2, dumpable_fds=2))
+        self.assertEqual(verdict["level"], eligibility.OK)
+        self.assertEqual(verdict["reasons"], [])
+
+    def test_only_the_descriptors_left_behind_are_counted(self):
+        verdict = eligibility.verdict_from_report(
+            report(open_fds=5, dumpable_fds=3, volatile_fds=1)
+        )
+        message = verdict["reasons"][0]["message"]
+        self.assertIn("1 socket or pipe and 1 other descriptor ", message)
+        self.assertNotIn("3", message)
+
+    def test_a_report_without_dumpable_fds_counts_every_descriptor_as_lost(self):
+        # an engine from before the fd table only reports open and volatile
+        facts = report(open_fds=1)
+        del facts["facts"]["dumpable_fds"]
+        verdict = eligibility.verdict_from_report(facts)
+        self.assertEqual(verdict["reasons"][0]["code"], "open_files")
 
     def test_children_are_risky(self):
         verdict = eligibility.verdict_from_report(report(children=2))

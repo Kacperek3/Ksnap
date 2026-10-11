@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <linux/limits.h>
+#include <signal.h> // for kill
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -20,28 +21,49 @@
 #include "config.h"
 #include "dump_format.h"
 #include "dumper.h"
+#include "fds.h"
 #include "maps.h"
+#include <ctype.h>
+#include <elf.h> // for NT_X86_XSTATE
 #include <fcntl.h>
+#include <linux/kcmp.h>  // for KCMP_FILE
+#include <sys/syscall.h> // for SYS_kcmp, glibc has no wrapper
+#include <sys/uio.h>     // for struct iovec
 
 #define VMA_TABLE_INITIAL_CAPACITY 64
+#define FD_TABLE_INITIAL_CAPACITY 16
 #define PATH_POOL_INITIAL_CAPACITY 4096
+
+// the path strings of the snapshot, the vma table and the fd table both point
+// into it by offset
+typedef struct {
+    char *data;
+    uint64_t size;
+    uint64_t capacity;
+} path_pool_t;
 
 // private main functions
 static int read_regs(pid_t pid, struct user_regs_struct *regs);
+static int read_xstate(pid_t pid, void **out_xstate, uint32_t *out_size);
 static int read_exe_path(pid_t pid, char exe_path[PATH_MAX],
                          uint32_t *exe_path_len);
 static int collect_vmas(pid_t pid, vma_descriptor_t **out_vmas,
-                        uint32_t *out_count, char **out_pool,
-                        uint64_t *out_pool_size, kernel_map_t *kernel_maps,
+                        uint32_t *out_count, path_pool_t *pool,
+                        kernel_map_t *kernel_maps,
                         uint32_t *out_kernel_map_count);
-static int write_snapshot(pid_t pid, const char *snapshot_path,
-                          const struct user_regs_struct *regs,
-                          const char *exe_path, uint32_t exe_path_len,
-                          vma_descriptor_t *vmas, uint32_t vma_count,
-                          const char *pool, uint64_t pool_size,
-                          const kernel_map_t *kernel_maps,
-                          uint32_t kernel_map_count);
+static int collect_fds(pid_t pid, fd_descriptor_t **out_fds,
+                       uint32_t *out_count, path_pool_t *pool);
+static int write_snapshot(
+    pid_t pid, const char *snapshot_path, const struct user_regs_struct *regs,
+    const void *xstate, uint32_t xstate_size, const char *exe_path,
+    uint32_t exe_path_len, vma_descriptor_t *vmas, uint32_t vma_count,
+    const fd_descriptor_t *fds, uint32_t fd_count, const path_pool_t *pool,
+    const kernel_map_t *kernel_maps, uint32_t kernel_map_count);
 //
+static int pool_append(path_pool_t *pool, const char *path,
+                       uint32_t *out_offset);
+static void find_shared_files(pid_t pid, fd_descriptor_t *fds, uint32_t count,
+                              const path_pool_t *pool);
 static int write_vma_payload(FILE *snapshot_handle, int mem_vma_handle,
                              const vma_descriptor_t *vma, char buff[]);
 
@@ -50,12 +72,15 @@ int dump(ksnap_config_t config) {
     int result = ERROR;
 
     struct user_regs_struct regs;
+    void *xstate = NULL;
+    uint32_t xstate_size = 0;
     char exe_path[PATH_MAX];
     uint32_t exe_path_len = 0;
     vma_descriptor_t *vmas = NULL;
     uint32_t vma_count = 0;
-    char *path_pool = NULL;
-    uint64_t path_pool_size = 0;
+    fd_descriptor_t *fds = NULL;
+    uint32_t fd_count = 0;
+    path_pool_t path_pool = {0};
     kernel_map_t kernel_maps[KSNAP_MAX_KERNEL_MAPS];
     uint32_t kernel_map_count = 0;
     char snapshot_path[PATH_MAX];
@@ -97,29 +122,58 @@ int dump(ksnap_config_t config) {
     // /proc/pid/mem        - physical memory areas
     // /proc/pid/maps       - areas important to save from mem
     // /proc/pid/exe        - path to executable program
+    // /proc/pid/fd         - open descriptors, fdinfo holds their offsets
 
     // 1.
     if (read_regs(config.pid, &regs) != OK)
+        goto detach;
+    // 1b. the general registers alone are not the whole CPU state, a process
+    // stopped in the middle of a computation keeps live values in xmm/ymm and
+    // its rounding mode in MXCSR
+    if (read_xstate(config.pid, &xstate, &xstate_size) != OK)
         goto detach;
     // 2.
     if (read_exe_path(config.pid, exe_path, &exe_path_len) != OK)
         goto detach;
     // 3. the whole table is collected before any memory is read, so the
     // snapshot layout is known up front
-    if (collect_vmas(config.pid, &vmas, &vma_count, &path_pool, &path_pool_size,
-                     kernel_maps, &kernel_map_count) != OK)
+    if (collect_vmas(config.pid, &vmas, &vma_count, &path_pool, kernel_maps,
+                     &kernel_map_count) != OK)
+        goto detach;
+    // 3b. the regular files it has open, their paths join the same pool
+    if (collect_fds(config.pid, &fds, &fd_count, &path_pool) != OK)
         goto detach;
     // 4.
-    if (write_snapshot(config.pid, snapshot_path, &regs, exe_path, exe_path_len,
-                       vmas, vma_count, path_pool, path_pool_size, kernel_maps,
-                       kernel_map_count) != OK)
+    if (write_snapshot(config.pid, snapshot_path, &regs, xstate, xstate_size,
+                       exe_path, exe_path_len, vmas, vma_count, fds, fd_count,
+                       &path_pool, kernel_maps, kernel_map_count) != OK)
         goto detach;
 
     result = OK;
 
 detach:
+    free(xstate);
     free(vmas);
-    free(path_pool);
+    free(fds);
+    free(path_pool.data);
+
+    // -k: the process is killed while it is still stopped by ptrace, so it
+    // never executes a single instruction past the state in the snapshot.
+    // Only a complete snapshot ends it, a failed dump releases it as usual.
+    if (result == OK && config.kill_after_dump) {
+        if (kill(config.pid, SIGKILL) == 0) {
+            // the tracer is told about the death too, collect that notice
+            waitpid(config.pid, &status, 0);
+            printf("Process %d terminated after the snapshot\n", config.pid);
+            return OK;
+        }
+
+        fprintf(stderr,
+                "Error: the snapshot is saved, but process %d could not be "
+                "terminated: %s\n",
+                config.pid, strerror(errno));
+        result = ERROR;
+    }
 
     // waking the process
     if (ptrace(PTRACE_DETACH, config.pid, NULL, NULL) == -1) {
@@ -135,6 +189,37 @@ static int read_regs(pid_t pid, struct user_regs_struct *regs) {
         perror("Error: cannot read the registers of the target");
         return ERROR;
     }
+    return OK;
+}
+
+// fpu dump
+static int read_xstate(pid_t pid, void **out_xstate, uint32_t *out_size) {
+    void *xstate = calloc(1, KSNAP_XSTATE_MAX_SIZE);
+    if (xstate == NULL) {
+        perror("Error: out of memory for the xstate");
+        return ERROR;
+    }
+
+    struct iovec iov = {.iov_base = xstate, .iov_len = KSNAP_XSTATE_MAX_SIZE};
+
+    if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_X86_XSTATE, &iov) == -1) {
+        perror("Error: cannot read the FPU/SSE/AVX state of the target");
+        free(xstate);
+        return ERROR;
+    }
+
+    // a full buffer could mean the area was cut short, restoring half of it
+    // would be worse than refusing
+    if (iov.iov_len < KSNAP_XSTATE_MIN_SIZE ||
+        iov.iov_len >= KSNAP_XSTATE_MAX_SIZE) {
+        fprintf(stderr, "Error: unexpected xstate size of %zu bytes\n",
+                iov.iov_len);
+        free(xstate);
+        return ERROR;
+    }
+
+    *out_xstate = xstate;
+    *out_size = (uint32_t)iov.iov_len;
     return OK;
 }
 
@@ -161,17 +246,14 @@ static int read_exe_path(pid_t pid, char exe_path[PATH_MAX],
 }
 
 static int collect_vmas(pid_t pid, vma_descriptor_t **out_vmas,
-                        uint32_t *out_count, char **out_pool,
-                        uint64_t *out_pool_size, kernel_map_t *kernel_maps,
+                        uint32_t *out_count, path_pool_t *pool,
+                        kernel_map_t *kernel_maps,
                         uint32_t *out_kernel_map_count) {
     int result = ERROR;
     FILE *maps_file_handle = NULL;
     vma_descriptor_t *vmas = NULL;
-    char *pool = NULL;
     uint32_t count = 0;
     uint32_t capacity = 0;
-    uint64_t pool_size = 0;
-    uint64_t pool_capacity = 0;
     uint32_t kernel_map_count = 0;
 
     char maps_line[MAPS_LINE_MAX];
@@ -250,32 +332,10 @@ static int collect_vmas(pid_t pid, vma_descriptor_t **out_vmas,
         }
 
         uint64_t path_len = strlen(parsed.path);
-        uint64_t path_offset = 0;
+        uint32_t path_offset = 0;
 
-        if (path_len > 0) {
-            // paths are stored NUL terminated so a reader can use the pool
-            // in place instead of copying out of it
-            uint64_t needed = pool_size + path_len + 1;
-            if (needed > pool_capacity) {
-                uint64_t new_capacity = (pool_capacity == 0)
-                                            ? PATH_POOL_INITIAL_CAPACITY
-                                            : pool_capacity * 2;
-                while (new_capacity < needed)
-                    new_capacity *= 2;
-
-                char *grown = realloc(pool, new_capacity);
-                if (grown == NULL) {
-                    perror("Error: out of memory for the path pool");
-                    goto cleanup;
-                }
-                pool = grown;
-                pool_capacity = new_capacity;
-            }
-
-            path_offset = pool_size;
-            memcpy(pool + pool_size, parsed.path, path_len + 1);
-            pool_size += path_len + 1;
-        }
+        if (path_len > 0 && pool_append(pool, parsed.path, &path_offset) != OK)
+            goto cleanup;
 
         vma_descriptor_t *vma = &vmas[count];
         vma->start_address = parsed.start;
@@ -284,7 +344,7 @@ static int collect_vmas(pid_t pid, vma_descriptor_t **out_vmas,
         vma->data_offset = 0; // assigned once the snapshot layout is known
         vma->prot = perms_to_prot(parsed.privileges);
         vma->map_flags = perms_to_map_flags(parsed.privileges);
-        vma->path_offset = (uint32_t)path_offset;
+        vma->path_offset = path_offset;
         vma->path_len = (uint32_t)path_len;
         count++;
     }
@@ -302,28 +362,187 @@ static int collect_vmas(pid_t pid, vma_descriptor_t **out_vmas,
 
     *out_vmas = vmas;
     *out_count = count;
-    *out_pool = pool;
-    *out_pool_size = pool_size;
     *out_kernel_map_count = kernel_map_count;
     vmas = NULL; // ownership moved to the caller
-    pool = NULL;
     result = OK;
 
 cleanup:
     if (maps_file_handle != NULL)
         fclose(maps_file_handle);
     free(vmas);
-    free(pool);
     return result;
 }
 
-static int write_snapshot(pid_t pid, const char *snapshot_path,
-                          const struct user_regs_struct *regs,
-                          const char *exe_path, uint32_t exe_path_len,
-                          vma_descriptor_t *vmas, uint32_t vma_count,
-                          const char *pool, uint64_t pool_size,
-                          const kernel_map_t *kernel_maps,
-                          uint32_t kernel_map_count) {
+static int compare_fd_descriptors(const void *left, const void *right) {
+    int32_t a = ((const fd_descriptor_t *)left)->fd;
+    int32_t b = ((const fd_descriptor_t *)right)->fd;
+    return (a > b) - (a < b);
+}
+
+static int collect_fds(pid_t pid, fd_descriptor_t **out_fds,
+                       uint32_t *out_count, path_pool_t *pool) {
+    int result = ERROR;
+    DIR *fd_dir_handle = NULL;
+    fd_descriptor_t *fds = NULL;
+    uint32_t count = 0;
+    uint32_t capacity = 0;
+    char path[PATH_MAX];
+
+    char process_path[64];
+    snprintf(process_path, sizeof(process_path), "/proc/%d/fd", pid);
+    fd_dir_handle = opendir(process_path);
+    if (fd_dir_handle == NULL) {
+        perror("Error during opening the virtual folder (proc/pid/fd)");
+        goto cleanup;
+    }
+
+    struct dirent *entry;
+    while ((entry = readdir(fd_dir_handle)) != NULL) {
+        if (!isdigit((unsigned char)entry->d_name[0]))
+            continue;
+
+        int fd = atoi(entry->d_name);
+        fd_class_t fd_class = classify_fd(pid, fd, path);
+
+        if (fd_class == FD_SKIP_STDIO)
+            continue;
+
+        // the target is stopped, so its descriptors cannot come and go
+        if (fd_class == FD_UNREADABLE) {
+            fprintf(stderr,
+                    "Error: descriptor %d of process %d cannot be read\n", fd,
+                    pid);
+            goto cleanup;
+        }
+
+        // the restored process simply will not have it, Check reports that
+        // before the dump as open_fds without a matching dumpable_fds
+        if (fd_class != FD_DUMP) {
+            fprintf(stderr, "Warning: descriptor %d (%s) is not carried over\n",
+                    fd, path);
+            continue;
+        }
+
+        if (count == capacity) {
+            uint32_t new_capacity =
+                (capacity == 0) ? FD_TABLE_INITIAL_CAPACITY : capacity * 2;
+            fd_descriptor_t *grown =
+                realloc(fds, (size_t)new_capacity * sizeof(*grown));
+            if (grown == NULL) {
+                perror("Error: out of memory for the fd table");
+                goto cleanup;
+            }
+            fds = grown;
+            capacity = new_capacity;
+        }
+
+        fd_descriptor_t *descriptor = &fds[count];
+        memset(descriptor, 0, sizeof(*descriptor));
+        descriptor->fd = fd;
+        descriptor->dup_of = -1;
+        descriptor->path_len = (uint32_t)strlen(path);
+
+        if (read_fd_state(pid, fd, &descriptor->position, &descriptor->flags) !=
+                OK ||
+            pool_append(pool, path, &descriptor->path_offset) != OK)
+            goto cleanup;
+
+        count++;
+    }
+
+    // readdir promises no order, the restore wants the table sorted
+    if (count > 1)
+        qsort(fds, count, sizeof(*fds), compare_fd_descriptors);
+    find_shared_files(pid, fds, count, pool);
+
+    *out_fds = fds;
+    *out_count = count;
+    fds = NULL; // ownership moved to the caller
+    result = OK;
+
+cleanup:
+    if (fd_dir_handle != NULL)
+        closedir(fd_dir_handle);
+    free(fds);
+    return result;
+}
+
+// two descriptors made by dup() share one open file, and with it one offset.
+// Reopening each by path would split them, so the later one is marked as a
+// copy of the earlier one and the restore dup()s it instead of opening it.
+static void find_shared_files(pid_t pid, fd_descriptor_t *fds, uint32_t count,
+                              const path_pool_t *pool) {
+    for (uint32_t i = 1; i < count; i++) {
+        const char *path = pool->data + fds[i].path_offset;
+
+        for (uint32_t j = 0; j < i; j++) {
+            // a dup has the same path, which spares kcmp for nearly every pair
+            if (fds[j].dup_of != -1 ||
+                strcmp(path, pool->data + fds[j].path_offset) != 0)
+                continue;
+
+            long order =
+                syscall(SYS_kcmp, pid, pid, KCMP_FILE, fds[j].fd, fds[i].fd);
+            if (order == -1) {
+                // every descriptor then gets an open file of its own, which
+                // only a process relying on a shared offset would notice
+                fprintf(stderr,
+                        "Warning: cannot compare descriptors, a dup() will "
+                        "come back as a separate open file: %s\n",
+                        strerror(errno));
+                return;
+            }
+
+            if (order == 0) {
+                fds[i].dup_of = fds[j].fd;
+                break;
+            }
+        }
+    }
+}
+
+static int pool_append(path_pool_t *pool, const char *path,
+                       uint32_t *out_offset) {
+    uint64_t path_len = strlen(path);
+
+    // paths are stored NUL terminated so a reader can use the pool in place
+    // instead of copying out of it
+    uint64_t needed = pool->size + path_len + 1;
+
+    // descriptors keep the offset in 32 bits
+    if (needed > UINT32_MAX) {
+        fprintf(stderr, "Error: the path pool outgrew 4 GiB\n");
+        return ERROR;
+    }
+
+    if (needed > pool->capacity) {
+        uint64_t new_capacity = (pool->capacity == 0)
+                                    ? PATH_POOL_INITIAL_CAPACITY
+                                    : pool->capacity * 2;
+        while (new_capacity < needed)
+            new_capacity *= 2;
+
+        char *grown = realloc(pool->data, new_capacity);
+        if (grown == NULL) {
+            perror("Error: out of memory for the path pool");
+            return ERROR;
+        }
+        pool->data = grown;
+        pool->capacity = new_capacity;
+    }
+
+    *out_offset = (uint32_t)pool->size;
+    memcpy(pool->data + pool->size, path, path_len + 1);
+    pool->size += path_len + 1;
+    return OK;
+}
+
+static int write_snapshot(
+    pid_t pid, const char *snapshot_path, const struct user_regs_struct *regs,
+    const void *xstate, uint32_t xstate_size, const char *exe_path,
+    uint32_t exe_path_len, vma_descriptor_t *vmas, uint32_t vma_count,
+    const fd_descriptor_t *fds, uint32_t fd_count, const path_pool_t *pool,
+    const kernel_map_t *kernel_maps, uint32_t kernel_map_count) {
     int result = ERROR;
     FILE *snapshot_handle = NULL;
     int mem_file_handle = -1;
@@ -355,10 +574,15 @@ static int write_snapshot(pid_t pid, const char *snapshot_path,
     header.version = KSNAP_FORMAT_VERSION;
     header.vma_count = vma_count;
     header.vma_table_offset = sizeof(header);
-    header.path_pool_offset =
+    header.fd_count = fd_count;
+    header.fd_table_offset =
         header.vma_table_offset + (uint64_t)vma_count * sizeof(*vmas);
-    header.path_pool_size = pool_size;
-    header.data_offset = header.path_pool_offset + pool_size;
+    header.path_pool_offset =
+        header.fd_table_offset + (uint64_t)fd_count * sizeof(*fds);
+    header.path_pool_size = pool->size;
+    header.xstate_offset = header.path_pool_offset + pool->size;
+    header.xstate_size = xstate_size;
+    header.data_offset = header.xstate_offset + xstate_size;
     header.exe_path_len = exe_path_len;
     memcpy(header.exe_path, exe_path, exe_path_len);
     header.kernel_map_count = kernel_map_count;
@@ -383,9 +607,20 @@ static int write_snapshot(pid_t pid, const char *snapshot_path,
         goto cleanup;
     }
 
-    if (pool_size > 0 &&
-        fwrite(pool, 1, pool_size, snapshot_handle) != pool_size) {
+    if (fd_count > 0 &&
+        fwrite(fds, sizeof(*fds), fd_count, snapshot_handle) != fd_count) {
+        perror("Write operation failure (snapshot fd table)");
+        goto cleanup;
+    }
+
+    if (pool->size > 0 &&
+        fwrite(pool->data, 1, pool->size, snapshot_handle) != pool->size) {
         perror("Write operation failure (snapshot path pool)");
+        goto cleanup;
+    }
+
+    if (fwrite(xstate, 1, xstate_size, snapshot_handle) != xstate_size) {
+        perror("Write operation failure (snapshot xstate)");
         goto cleanup;
     }
 
@@ -416,6 +651,14 @@ static int write_snapshot(pid_t pid, const char *snapshot_path,
 cleanup:
     if (mem_file_handle != -1)
         close(mem_file_handle);
+
+    // a snapshot is only done once it is on the disk, not only in the page
+    // cache. With -k it is about to become the only copy of the process.
+    if (result == OK &&
+        (fflush(snapshot_handle) != 0 || fsync(fileno(snapshot_handle)) != 0)) {
+        perror("Error during flushing the snapshot file to disk");
+        result = ERROR;
+    }
 
     // buffered payload data only reaches the disk on fclose, so a failure
     // here still means an incomplete dump

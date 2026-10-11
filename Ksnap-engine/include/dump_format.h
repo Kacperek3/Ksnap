@@ -9,17 +9,32 @@
 //
 //   [ksnap_dump_header_t]                       at offset 0
 //   [vma_descriptor_t] x vma_count              at vma_table_offset
+//   [fd_descriptor_t] x fd_count                at fd_table_offset
 //   [path string pool]                          at path_pool_offset
+//   [XSAVE area, FPU/SSE/AVX state]             at xstate_offset
 //   [segment payloads]                          first one at data_offset
+//
+// The XSAVE area sits in front of the payloads on purpose: everything from
+// data_offset to the end of the file is memory, which is what Check promises
+// in snapshot_bytes. The fd table sits there for the same reason.
+//
+// The path pool is shared: mappings and descriptors both point into it.
 //
 
 #define KSNAP_MAGIC "KSNAPDMP"
 #define KSNAP_MAGIC_LEN 8
-#define KSNAP_FORMAT_VERSION 2
+#define KSNAP_FORMAT_VERSION 4
 
 // room for [vvar] [vvar_vclock] and [vdso]
 #define KSNAP_MAX_KERNEL_MAPS 4
 #define KSNAP_KERNEL_MAP_NAME_LEN 32
+
+// bounds of the XSAVE area returned by PTRACE_GETREGSET with NT_X86_XSTATE.
+// The smallest one is the 512 byte legacy FXSAVE region plus the 64 byte XSAVE
+// header. The size grows with the CPU features (AVX, AVX-512, AMX tiles), the
+// upper bound only keeps a damaged file from turning into a huge allocation.
+#define KSNAP_XSTATE_MIN_SIZE 576
+#define KSNAP_XSTATE_MAX_SIZE 65536
 
 // kernel owned mapping
 // the content is useless to copy but the address has to be kept
@@ -42,7 +57,21 @@ typedef struct {
     uint32_t kernel_map_count;
     kernel_map_t kernel_maps[KSNAP_MAX_KERNEL_MAPS];
     struct user_regs_struct regs;
+    // x87, MXCSR, xmm, ymm and the rest of the extended state, copied as the
+    // kernel hands it out. It depends on the CPU, so a snapshot moved to a
+    // machine without the same features is refused by PTRACE_SETREGSET.
+    uint64_t xstate_offset;
+    uint32_t xstate_size;
+    uint32_t xstate_reserved; // keeps the header free of implicit padding
+    
+    uint64_t fd_table_offset;
+    uint32_t fd_count;
+    uint32_t fd_reserved; // keeps the header free of implicit padding
 } ksnap_dump_header_t;
+
+_Static_assert(sizeof(ksnap_dump_header_t) == 4592,
+               "ksnap_dump_header_t changed, bump KSNAP_FORMAT_VERSION and "
+               "update Ksnap-web/Ksnap-backend/src/snapshot.py");
 
 typedef struct {
     uint64_t start_address;
@@ -57,6 +86,21 @@ typedef struct {
 
 _Static_assert(sizeof(vma_descriptor_t) == 48,
                "vma_descriptor_t must stay packed, bump KSNAP_FORMAT_VERSION "
+               "when it changes");
+
+
+typedef struct {
+    int32_t fd;           // descriptor number in the process, 3 or more
+    int32_t dup_of;       // -1, or a lower fd sharing the same open file
+    uint32_t flags;       // O_* as /proc/<pid>/fdinfo shows them, O_CLOEXEC too
+    uint32_t path_offset; // byte offset into the path pool
+    uint32_t path_len;    // length without the terminator, never 0
+    uint32_t reserved;    // keeps the struct free of implicit padding
+    uint64_t position;    // file offset, the one of the shared file for a dup
+} fd_descriptor_t;
+
+_Static_assert(sizeof(fd_descriptor_t) == 32,
+               "fd_descriptor_t must stay packed, bump KSNAP_FORMAT_VERSION "
                "when it changes");
 
 #endif // DUMP_FORMAT_H

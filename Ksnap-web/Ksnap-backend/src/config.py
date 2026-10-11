@@ -22,6 +22,10 @@ ENGINE_BINARY = _path_from_env(
 SNAPSHOT_DIR = _path_from_env(
     "KSNAP_SNAPSHOT_DIR", REPO_ROOT / "Ksnap-engine" / "save"
 )
+# every other folder a dump was written to, see directories.py
+DIRECTORIES_FILE = _path_from_env(
+    "KSNAP_DIRECTORIES_FILE", SNAPSHOT_DIR / "directories.json"
+)
 FRONTEND_DIR = _path_from_env(
     "KSNAP_FRONTEND_DIR", REPO_ROOT / "Ksnap-web" / "Ksnap-frontend" / "src"
 )

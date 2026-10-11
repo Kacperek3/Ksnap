@@ -9,6 +9,7 @@ from test_check import report
 
 import app as app_module
 import config
+import directories
 import eligibility
 import engine
 import processes
@@ -24,6 +25,18 @@ class ApiTest(unittest.TestCase):
         patched = mock.patch.object(config, "SNAPSHOT_DIR", self.snapshots)
         patched.start()
         self.addCleanup(patched.stop)
+
+        # the folder registry lives next to the store, never in the real one
+        patched_registry = mock.patch.object(
+            config, "DIRECTORIES_FILE", self.snapshots / "directories.json"
+        )
+        patched_registry.start()
+        self.addCleanup(patched_registry.stop)
+
+        # a second folder a dump can be pointed at
+        self.other_directory = tempfile.TemporaryDirectory()
+        self.other = Path(self.other_directory.name).resolve()
+        self.addCleanup(self.other_directory.cleanup)
 
         # a fake /proc for the display fields, plus canned engine reports for
         # the verdicts: one process per level
@@ -141,7 +154,27 @@ class ApiTest(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        dump.assert_called_once_with(4321, "counter-4321")
+        dump.assert_called_once_with(4321, "counter-4321", kill=False, directory=None)
+        self.assertFalse(response.get_json()["killed"])
+
+    def test_dump_can_end_the_process(self):
+        with mock.patch.object(engine, "dump", return_value={"name": "x.ksnap"}) as dump:
+            response = self.client.post(
+                "/api/dump", json={"pid": 4321, "name": "counter-4321", "kill": True}
+            )
+
+        self.assertEqual(response.status_code, 200)
+        dump.assert_called_once_with(4321, "counter-4321", kill=True, directory=None)
+        self.assertTrue(response.get_json()["killed"])
+
+    def test_dump_refuses_a_kill_flag_that_is_not_a_boolean(self):
+        with mock.patch.object(engine, "dump") as dump:
+            response = self.client.post(
+                "/api/dump", json={"pid": 4321, "kill": "yes"}
+            )
+
+        self.assertEqual(response.status_code, 400)
+        dump.assert_not_called()
 
     def test_dump_refuses_a_process_the_engine_cannot_restore(self):
         with mock.patch.object(engine, "dump") as dump:
@@ -211,8 +244,75 @@ class ApiTest(unittest.TestCase):
         with mock.patch.object(engine, "restore", return_value=session) as restore:
             response = self.client.post("/api/restore", json={"name": "counter.ksnap"})
 
-        restore.assert_called_once_with("counter.ksnap")
+        restore.assert_called_once_with(
+            "counter.ksnap", directory=self.snapshots.resolve()
+        )
         self.assertEqual(response.get_json()["restore"], session)
+
+    # --------------------------------------------------------------- folders
+
+    def test_dump_into_another_folder_creates_it(self):
+        target = self.other / "nested" / "store"
+        with mock.patch.object(engine, "dump", return_value={"name": "x.ksnap"}) as dump:
+            response = self.client.post(
+                "/api/dump", json={"pid": 4321, "directory": str(target)}
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(target.is_dir())
+        self.assertEqual(dump.call_args.kwargs["directory"], target)
+
+    def test_dump_refuses_a_relative_folder(self):
+        with mock.patch.object(engine, "dump") as dump:
+            response = self.client.post(
+                "/api/dump", json={"pid": 4321, "directory": "snapshots/here"}
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("absolute", response.get_json()["error"])
+        dump.assert_not_called()
+
+    def test_listing_covers_every_remembered_folder(self):
+        self.write_snapshot("home.ksnap")
+        (self.other / "away.ksnap").write_bytes(build_snapshot())
+        directories.remember(self.other)
+
+        payload = self.client.get("/api/snapshots").get_json()
+
+        found = {item["name"]: item["directory"] for item in payload["snapshots"]}
+        self.assertEqual(found["home.ksnap"], str(self.snapshots.resolve()))
+        self.assertEqual(found["away.ksnap"], str(self.other))
+        self.assertEqual(
+            payload["directories"], [str(self.snapshots.resolve()), str(self.other)]
+        )
+
+    def test_restore_and_delete_refuse_a_folder_the_panel_never_wrote_to(self):
+        (self.other / "away.ksnap").write_bytes(build_snapshot())
+
+        with mock.patch.object(engine, "restore") as restore:
+            response = self.client.post(
+                "/api/restore",
+                json={"name": "away.ksnap", "directory": str(self.other)},
+            )
+        self.assertEqual(response.status_code, 400)
+        restore.assert_not_called()
+
+        response = self.client.delete(
+            "/api/snapshots/away.ksnap", query_string={"directory": str(self.other)}
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertTrue((self.other / "away.ksnap").exists())
+
+    def test_delete_works_in_a_remembered_folder(self):
+        (self.other / "away.ksnap").write_bytes(build_snapshot())
+        directories.remember(self.other)
+
+        response = self.client.delete(
+            "/api/snapshots/away.ksnap", query_string={"directory": str(self.other)}
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse((self.other / "away.ksnap").exists())
 
     def test_stop_without_a_session_is_reported_as_a_conflict(self):
         self.assertEqual(self.client.post("/api/restore/stop").status_code, 409)
@@ -265,6 +365,39 @@ class EngineCommandTest(unittest.TestCase):
             ["/opt/Ksnap", "-m", "Dump", "-p", "1234", "-d", directory, "-n", "a.ksnap"],
         )
         self.assertNotIn("shell", run.call_args[1])
+
+    def test_dump_with_kill_passes_k_to_the_engine(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(config, "SNAPSHOT_DIR", Path(directory)), \
+                 mock.patch.object(engine, "_binary", return_value="/opt/Ksnap"), \
+                 mock.patch.object(config, "uses_sudo", return_value=False), \
+                 mock.patch("subprocess.run") as run, \
+                 mock.patch("snapshot.read_header", return_value={"name": "a.ksnap"}):
+                run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+
+                engine.dump(1234, "a", kill=True)
+
+        self.assertEqual(run.call_args[0][0][-1], "-k")
+
+    def test_dump_into_another_folder_passes_it_as_d_and_remembers_it(self):
+        with tempfile.TemporaryDirectory() as store, \
+             tempfile.TemporaryDirectory() as other:
+            registry = Path(store) / "directories.json"
+            with mock.patch.object(config, "SNAPSHOT_DIR", Path(store)), \
+                 mock.patch.object(config, "DIRECTORIES_FILE", registry), \
+                 mock.patch.object(engine, "_binary", return_value="/opt/Ksnap"), \
+                 mock.patch.object(config, "uses_sudo", return_value=False), \
+                 mock.patch("subprocess.run") as run, \
+                 mock.patch("snapshot.read_header", return_value={"name": "a.ksnap"}):
+                run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+
+                header = engine.dump(1234, "a", directory=Path(other))
+                remembered = directories.known()
+
+            argv = run.call_args[0][0]
+            self.assertEqual(argv[argv.index("-d") + 1], other)
+            self.assertEqual(header["directory"], other)
+            self.assertIn(Path(other).resolve(), remembered)
 
     def test_dump_is_prefixed_with_sudo_when_the_api_is_not_root(self):
         with tempfile.TemporaryDirectory() as directory:
