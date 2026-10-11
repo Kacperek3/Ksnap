@@ -128,7 +128,7 @@ called `ok` can still be refused at the gate with `ptrace_refused`.
 | code | From the fact | Why it only warns |
 | --- | --- | --- |
 | `arguments_not_restored` | `argc > 1` | the restore execs `argv = {exe_path}`, so the process starts without its arguments |
-| `open_files` | `open_fds`, `volatile_fds` | descriptors are not in the snapshot, the restored process gets the engine's stdio |
+| `open_files` | `open_fds - dumpable_fds`, `volatile_fds` | only regular files are reopened on restore, sockets, pipes, devices and deleted files are lost; 0, 1 and 2 are always the engine's stdio |
 | `has_children` | `children` | children are neither dumped nor restored |
 | `large_snapshot` | `snapshot_bytes` over `KSNAP_MAX_SNAPSHOT_MB` | a big snapshot is a big file, not a failure |
 | `path_with_space` | a space in `exe` | the maps parser scans paths with `%s` |
@@ -170,12 +170,16 @@ The engine reports these through Check rather than discovering them mid dump:
 * single threaded processes only (`multi_threaded`)
 * shared memory and device mappings are not carried over (`shared_mapping`,
   `device_mapping`)
-* file descriptors, sockets, process trees and the working directory are not
-  restored (`open_files`, `has_children`)
+* of the open descriptors only regular files are restored, reopened by path
+  with their offset and flags; sockets, pipes, devices, deleted files, process
+  trees and the working directory are not (`open_files`, `has_children`)
+* a reopened file is the file as it is at restore time, its content is not part
+  of the snapshot, and a restore fails when one of them is gone
 * a restored process is started from the snapshot's own executable path, with
   no command line arguments (`arguments_not_restored`)
 * a snapshot only restores on the kernel it was taken on, because the vdso has
   to match, and on a CPU with the same extended features (AVX, AVX-512, ...),
   because the FPU/SSE/AVX state is stored as the XSAVE area of the dumping CPU
-* snapshots taken before format version 3 (no FPU/SSE/AVX state) are listed
-  with an error and cannot be restored, they have to be taken again
+* snapshots taken before format version 4 (no FPU/SSE/AVX state before 3, no
+  open files before 4) are listed with an error and cannot be restored, they
+  have to be taken again

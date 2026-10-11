@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 MAGIC = b"KSNAPDMP"
-FORMAT_VERSION = 3
+FORMAT_VERSION = 4
 
 MAX_KERNEL_MAPS = 4
 KERNEL_MAP_NAME_LEN = 32
@@ -21,13 +21,14 @@ PATH_MAX = 4096
 #   magic[8], version, vma_count, vma_table_offset, path_pool_offset,
 #   path_pool_size, data_offset, exe_path_len, exe_path[PATH_MAX],
 #   kernel_map_count, kernel_maps[4], regs, xstate_offset, xstate_size,
-#   xstate_reserved
+#   xstate_reserved, fd_table_offset, fd_count, fd_reserved
 _KERNEL_MAP_FORMAT = "QQ32s"
 _REGS_COUNT = 27  # struct user_regs_struct on x86_64
 HEADER_FORMAT = (
     "<8sIIQQQQI%dsI" % PATH_MAX
     + _KERNEL_MAP_FORMAT * MAX_KERNEL_MAPS
     + "%dQ" % _REGS_COUNT
+    + "QII"
     + "QII"
 )
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
@@ -116,6 +117,7 @@ def read_header(path):
     regs_start = 10 + MAX_KERNEL_MAPS * 3
     regs = fields[regs_start : regs_start + _REGS_COUNT]
     xstate_size = fields[regs_start + _REGS_COUNT + 1]
+    fd_count = fields[regs_start + _REGS_COUNT + 4]
     stat = path.stat()
 
     return {
@@ -131,6 +133,7 @@ def read_header(path):
         "rip": "0x%x" % regs[_RIP],
         "rsp": "0x%x" % regs[_RSP],
         "xstate_size": xstate_size,
+        "fd_count": fd_count,
     }
 
 

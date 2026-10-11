@@ -36,19 +36,21 @@ def _caveats(facts):
         )
 
     volatile = facts.get("volatile_fds", 0)
-    extra = facts.get("open_fds", 0)
-    if extra:
+    lost = facts.get("open_fds", 0) - facts.get("dumpable_fds", 0)
+    if lost > 0:
         details = []
         if volatile:
             details.append(_count(volatile, "socket or pipe", "sockets or pipes"))
-        if extra - volatile > 0:
-            details.append(_count(extra - volatile, "open file", "open files"))
+        if lost - volatile > 0:
+            details.append(
+                _count(lost - volatile, "other descriptor", "other descriptors")
+            )
         reasons.append(
             _reason(
                 "open_files",
                 RISKY,
-                "the snapshot stores no descriptors, so %s will be lost on "
-                "restore"
+                "the snapshot reopens regular files only, so %s will be lost "
+                "on restore"
                 % " and ".join(details),
             )
         )

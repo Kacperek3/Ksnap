@@ -39,13 +39,16 @@ def build_snapshot(exe_path="/bin/counter", vma_count=7, version=snapshot.FORMAT
         snapshot.HEADER_SIZE + vma_count * 48,
         832,
         0,
+        snapshot.HEADER_SIZE + vma_count * 48,
+        2,
+        0,
     ) + b"\x00" * 128
 
 
 class HeaderLayoutTest(unittest.TestCase):
     def test_header_size_matches_the_engine(self):
         # dump_format.h: sizeof(ksnap_dump_header_t) on x86_64
-        self.assertEqual(snapshot.HEADER_SIZE, 4576)
+        self.assertEqual(snapshot.HEADER_SIZE, 4592)
 
 
 class ReadHeaderTest(unittest.TestCase):
@@ -68,6 +71,7 @@ class ReadHeaderTest(unittest.TestCase):
         self.assertEqual(header["rip"], "0x401136")
         self.assertEqual(header["rsp"], "0x7ffd1234")
         self.assertEqual(header["xstate_size"], 832)
+        self.assertEqual(header["fd_count"], 2)
         self.assertEqual(header["kernel_maps"], [
             {"name": "[vdso]", "start_address": "0x7ffff7fc0000", "size": 8192}
         ])

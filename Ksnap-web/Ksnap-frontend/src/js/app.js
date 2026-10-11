@@ -301,7 +301,8 @@ function renderSnapshotRow(tbody, snapshot) {
     path.textContent = pathText(snapshot.exe_path);
     path.title =
       `${snapshot.exe_path}\nRIP ${snapshot.rip}  RSP ${snapshot.rsp}` +
-      `\nFPU/SSE/AVX state ${snapshot.xstate_size} B`;
+      `\nFPU/SSE/AVX state ${snapshot.xstate_size} B` +
+      `\n${plural(snapshot.fd_count, "open file", "open files")} reopened on restore`;
     executable.appendChild(path);
     cell(row, snapshot.vma_count, "text-end");
   }
@@ -447,12 +448,13 @@ function describeCaveat(caveat, facts) {
     case "arguments_not_restored":
       return { title: "Command line arguments", detail: "The process restarts without them" };
     case "open_files": {
+      // regular files are reopened on restore, only the rest is lost
       const volatile = facts.volatile_fds || 0;
-      const files = (facts.open_fds || 0) - volatile;
+      const other = (facts.open_fds || 0) - (facts.dumpable_fds || 0) - volatile;
       const parts = [];
       if (volatile) parts.push(plural(volatile, "socket or pipe", "sockets or pipes"));
-      if (files > 0) parts.push(plural(files, "file", "files"));
-      return { title: "Open descriptors", detail: parts.join(", ") || caveat.message };
+      if (other > 0) parts.push(plural(other, "other descriptor", "other descriptors"));
+      return { title: "Lost descriptors", detail: parts.join(", ") || caveat.message };
     }
     case "has_children":
       return {

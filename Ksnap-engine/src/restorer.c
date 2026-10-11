@@ -29,18 +29,33 @@
 #define PARENT
 #define CHILD 0
 
+// the kernel drops these from a file's flags right after open, so only a
+// crafted snapshot carries them, and reopening with them as root would create
+// or wipe a file
+#define KSNAP_FD_FORBIDDEN_FLAGS                                               \
+    (O_CREAT | O_EXCL | O_TRUNC | (O_TMPFILE & ~O_DIRECTORY))
+
 // private functions
 static int read_snapshot_metadata(FILE *snapshot_handle,
                                   ksnap_dump_header_t *header,
                                   vma_descriptor_t **out_vmas,
-                                  void **out_xstate);
+                                  void **out_xstate, fd_descriptor_t **out_fds,
+                                  char **out_pool);
+static int read_fd_table(FILE *snapshot_handle,
+                         const ksnap_dump_header_t *header, uint64_t file_size,
+                         fd_descriptor_t **out_fds, char **out_pool);
 static int restore_vma(pid_t pid, int mem_fd, FILE *snapshot_handle,
                        const vma_descriptor_t *vma, char buff[]);
 static int restore_kernel_maps(pid_t pid, const ksnap_dump_header_t *header);
 static int inject_mmap_syscall(pid_t pid, const vma_descriptor_t *vma);
 static int restore_protections(pid_t pid, const vma_descriptor_t *vmas,
                                uint32_t vma_count);
-static int spawn_traced_child(const char *exe_path);
+static int restore_fd_flags(pid_t pid, const fd_descriptor_t *fds,
+                            uint32_t fd_count);
+static int open_snapshot_fds(const fd_descriptor_t *fds, uint32_t fd_count,
+                             const char *pool);
+static int spawn_traced_child(const char *exe_path, const fd_descriptor_t *fds,
+                              uint32_t fd_count, const char *pool);
 static int set_final_regs(pid_t pid, const struct user_regs_struct *regs);
 static int set_final_xstate(pid_t pid, void *xstate, uint32_t xstate_size);
 // ------
@@ -50,6 +65,8 @@ int restorer(ksnap_config_t config) {
     ksnap_dump_header_t header;
     vma_descriptor_t *vmas = NULL;
     void *xstate = NULL;
+    fd_descriptor_t *fds = NULL;
+    char *path_pool = NULL;
     char snapshot_path[PATH_MAX];
 
     if (build_snapshot_path(&config, snapshot_path) != OK)
@@ -62,8 +79,8 @@ int restorer(ksnap_config_t config) {
         return ERROR;
     }
 
-    if (read_snapshot_metadata(snapshot_handle, &header, &vmas, &xstate) !=
-        OK) {
+    if (read_snapshot_metadata(snapshot_handle, &header, &vmas, &xstate, &fds,
+                               &path_pool) != OK) {
         fclose(snapshot_handle);
         return ERROR;
     }
@@ -73,6 +90,8 @@ int restorer(ksnap_config_t config) {
         perror("fork fail");
         free(vmas);
         free(xstate);
+        free(fds);
+        free(path_pool);
         fclose(snapshot_handle);
         return ERROR;
     } else if (new_process == CHILD) {
@@ -81,7 +100,9 @@ int restorer(ksnap_config_t config) {
         fclose(snapshot_handle);
         free(vmas);
         free(xstate);
-        spawn_traced_child(header.exe_path);
+        // the fd table is still needed, it is opened right before the exec,
+        // which then drops this whole address space anyway
+        spawn_traced_child(header.exe_path, fds, header.fd_count, path_pool);
     } else
         PARENT {
             // parent process here
@@ -89,7 +110,8 @@ int restorer(ksnap_config_t config) {
             waitpid(new_process, &status, 0);
             if (WIFSTOPPED(status)) {
 
-                // 1. metadata is already loaded
+                // 1. metadata is already loaded, the regular files are
+                //    already open, the child did that before its exec
                 // 2. use mmap with syscalls to recreate every area
                 // 3. copy the payload of each area into the child, then
                 //    give every area the protection it had in the snapshot
@@ -120,7 +142,9 @@ int restorer(ksnap_config_t config) {
                 if (mem_new_process_file_handle == -1) {
                     perror("Error during opening the virtual file "
                            "(proc/pid/mem)");
-                } else if (restore_kernel_maps(new_process, &header) != OK) {
+                } else if (restore_fd_flags(new_process, fds,
+                                            header.fd_count) != OK ||
+                           restore_kernel_maps(new_process, &header) != OK) {
                     close(mem_new_process_file_handle);
                     mem_new_process_file_handle = -1;
                 } else {
@@ -175,6 +199,8 @@ int restorer(ksnap_config_t config) {
                     waitpid(new_process, &status, 0);
                 }
             } else {
+                // a file that could not be reopened ends the child before its
+                // exec, and the child already said which one on stderr
                 fprintf(stderr, "Error: the new process did not stop for the "
                                 "restore\n");
 
@@ -190,6 +216,8 @@ int restorer(ksnap_config_t config) {
 
     free(vmas);
     free(xstate);
+    free(fds);
+    free(path_pool);
     fclose(snapshot_handle);
     return result;
 }
@@ -197,7 +225,8 @@ int restorer(ksnap_config_t config) {
 static int read_snapshot_metadata(FILE *snapshot_handle,
                                   ksnap_dump_header_t *header,
                                   vma_descriptor_t **out_vmas,
-                                  void **out_xstate) {
+                                  void **out_xstate, fd_descriptor_t **out_fds,
+                                  char **out_pool) {
     struct stat snapshot_stat;
 
     if (fread(header, sizeof(*header), 1, snapshot_handle) != 1) {
@@ -329,9 +358,142 @@ static int read_snapshot_metadata(FILE *snapshot_handle,
         return ERROR;
     }
 
+    if (read_fd_table(snapshot_handle, header, (uint64_t)snapshot_stat.st_size,
+                      out_fds, out_pool) != OK) {
+        free(xstate);
+        free(vmas);
+        return ERROR;
+    }
+
     *out_vmas = vmas;
     *out_xstate = xstate;
     return OK;
+}
+
+// offset and size come out of the file, so the sum could wrap around
+static bool fits_in_file(uint64_t offset, uint64_t size, uint64_t file_size) {
+    return size <= file_size && offset <= file_size - size;
+}
+
+static int compare_fd_number(const void *key, const void *element) {
+    int32_t fd = *(const int32_t *)key;
+    int32_t other = ((const fd_descriptor_t *)element)->fd;
+    return (fd > other) - (fd < other);
+}
+
+// the fd table is checked as hard as the vma table: under sudo the child opens
+// every path it names as root, and nothing of that is traced yet
+static int read_fd_table(FILE *snapshot_handle,
+                         const ksnap_dump_header_t *header, uint64_t file_size,
+                         fd_descriptor_t **out_fds, char **out_pool) {
+    fd_descriptor_t *fds = NULL;
+    char *pool = NULL;
+
+    *out_fds = NULL;
+    *out_pool = NULL;
+
+    // the process had nothing open besides stdio, the pool is not needed
+    if (header->fd_count == 0)
+        return OK;
+
+    uint64_t table_size = (uint64_t)header->fd_count * sizeof(*fds);
+    if (!fits_in_file(header->fd_table_offset, table_size, file_size) ||
+        !fits_in_file(header->path_pool_offset, header->path_pool_size,
+                      file_size)) {
+        fprintf(stderr, "Error: snapshot is truncated\n");
+        return ERROR;
+    }
+
+    if (header->path_pool_size == 0) {
+        fprintf(stderr, "Error: snapshot holds descriptors but no path pool "
+                        "for their paths\n");
+        return ERROR;
+    }
+
+    fds = malloc(table_size);
+    pool = malloc(header->path_pool_size);
+    if (fds == NULL || pool == NULL) {
+        perror("Error: out of memory for the fd table");
+        goto fail;
+    }
+
+    if (fseek(snapshot_handle, (long)header->fd_table_offset, SEEK_SET) != 0 ||
+        fread(fds, sizeof(*fds), header->fd_count, snapshot_handle) !=
+            header->fd_count) {
+        perror("Read operation failure (snapshot fd table)");
+        goto fail;
+    }
+
+    if (fseek(snapshot_handle, (long)header->path_pool_offset, SEEK_SET) != 0 ||
+        fread(pool, 1, header->path_pool_size, snapshot_handle) !=
+            header->path_pool_size) {
+        perror("Read operation failure (snapshot path pool)");
+        goto fail;
+    }
+
+    for (uint32_t i = 0; i < header->fd_count; i++) {
+        const fd_descriptor_t *entry = &fds[i];
+
+        if (entry->fd <= STDERR_FILENO) {
+            fprintf(stderr,
+                    "Error: snapshot holds descriptor %d, the restored process "
+                    "keeps the stdio of the engine\n",
+                    entry->fd);
+            goto fail;
+        }
+
+        // sorted and unique, so no number is claimed twice and a dup_of can
+        // only point at an entry that is already in place
+        if (i > 0 && entry->fd <= fds[i - 1].fd) {
+            fprintf(stderr, "Error: descriptors in the snapshot are not in "
+                            "ascending order\n");
+            goto fail;
+        }
+
+        if (entry->dup_of != -1 && bsearch(&entry->dup_of, fds, i, sizeof(*fds),
+                                           compare_fd_number) == NULL) {
+            fprintf(stderr,
+                    "Error: descriptor %d claims to share the open file of "
+                    "descriptor %d, which is not before it in the snapshot\n",
+                    entry->fd, entry->dup_of);
+            goto fail;
+        }
+
+        if (entry->flags & KSNAP_FD_FORBIDDEN_FLAGS) {
+            fprintf(stderr,
+                    "Error: descriptor %d would create or truncate its file "
+                    "on restore\n",
+                    entry->fd);
+            goto fail;
+        }
+
+        // room for the path and its terminator, inside the pool
+        if (entry->path_len == 0 || entry->path_len >= PATH_MAX ||
+            entry->path_offset >= header->path_pool_size ||
+            entry->path_len >= header->path_pool_size - entry->path_offset) {
+            fprintf(stderr,
+                    "Error: descriptor %d has a path outside the path pool\n",
+                    entry->fd);
+            goto fail;
+        }
+
+        const char *path = pool + entry->path_offset;
+        if (path[entry->path_len] != '\0' ||
+            memchr(path, '\0', entry->path_len) != NULL) {
+            fprintf(stderr, "Error: descriptor %d has a malformed path\n",
+                    entry->fd);
+            goto fail;
+        }
+    }
+
+    *out_fds = fds;
+    *out_pool = pool;
+    return OK;
+
+fail:
+    free(fds);
+    free(pool);
+    return ERROR;
 }
 
 static int restore_vma(pid_t pid, int mem_fd, FILE *snapshot_handle,
@@ -534,6 +696,31 @@ static int restore_protections(pid_t pid, const vma_descriptor_t *vmas,
     return OK;
 }
 
+// open_snapshot_fds had to leave O_CLOEXEC out, or the exec would have closed
+// those very descriptors, so it is given back now that the exec is behind
+static int restore_fd_flags(pid_t pid, const fd_descriptor_t *fds,
+                            uint32_t fd_count) {
+    for (uint32_t i = 0; i < fd_count; i++) {
+        unsigned long long syscall_result;
+
+        if (!(fds[i].flags & O_CLOEXEC))
+            continue;
+
+        if (inject_syscall(pid, SYS_fcntl, (unsigned long long)fds[i].fd,
+                           F_SETFD, FD_CLOEXEC, 0, 0, 0, &syscall_result) != OK)
+            return ERROR;
+
+        if (syscall_failed(syscall_result)) {
+            fprintf(stderr,
+                    "Error: cannot set FD_CLOEXEC on descriptor %d: %s\n",
+                    fds[i].fd, strerror(-(long)syscall_result));
+            return ERROR;
+        }
+    }
+
+    return OK;
+}
+
 // move the kernel mappings of the child back to the dumped addresses
 // glibc keeps resolved vdso pointers in its own data which we restore
 // so without this the first clock_gettime() jumps into an unmapped hole
@@ -616,13 +803,82 @@ static int restore_kernel_maps(pid_t pid, const ksnap_dump_header_t *header) {
     return OK;
 }
 
-static int spawn_traced_child(const char *exe_path) {
+// runs in the forked child, before the exec: a descriptor without O_CLOEXEC
+// survives execve, so the program wakes up with its files already in place.
+// Each one is reopened by path, wound to its offset and moved to its number.
+static int open_snapshot_fds(const fd_descriptor_t *fds, uint32_t fd_count,
+                             const char *pool) {
+    // whatever the engine inherited from its caller must not leak into the
+    // restored process, nor sit on a number the snapshot needs
+    if (close_range(STDERR_FILENO + 1, ~0U, 0) != 0) {
+        perror("Error: cannot close the descriptors of the engine");
+        return ERROR;
+    }
+
+    for (uint32_t i = 0; i < fd_count; i++) {
+        const fd_descriptor_t *entry = &fds[i];
+        const char *path = pool + entry->path_offset;
+
+        // a dup() of a lower descriptor, which the sorted table already put in
+        // place. dup2 shares its open file, and with it the offset.
+        if (entry->dup_of != -1) {
+            if (dup2(entry->dup_of, entry->fd) == -1) {
+                fprintf(stderr,
+                        "Error: cannot duplicate descriptor %d onto %d: %s\n",
+                        entry->dup_of, entry->fd, strerror(errno));
+                return ERROR;
+            }
+            continue;
+        }
+
+        // the file is not part of the snapshot, so it has to be where it was
+        int opened = open(path, (int)(entry->flags & ~(uint32_t)O_CLOEXEC));
+        if (opened == -1) {
+            fprintf(stderr, "Error: cannot reopen descriptor %d, %s: %s\n",
+                    entry->fd, path, strerror(errno));
+            return ERROR;
+        }
+
+        // an O_PATH descriptor has no offset and refuses lseek
+        if (!(entry->flags & O_PATH) &&
+            lseek(opened, (off_t)entry->position, SEEK_SET) == -1) {
+            fprintf(stderr,
+                    "Error: cannot seek descriptor %d to %" PRIu64 ": %s\n",
+                    entry->fd, entry->position, strerror(errno));
+            close(opened);
+            return ERROR;
+        }
+
+        // open takes the lowest free number, the wanted one only by chance, so
+        // the file is moved there and the temporary number given back
+        if (opened != entry->fd) {
+            if (dup2(opened, entry->fd) == -1) {
+                fprintf(stderr,
+                        "Error: cannot move %s onto descriptor %d: %s\n", path,
+                        entry->fd, strerror(errno));
+                close(opened);
+                return ERROR;
+            }
+            close(opened);
+        }
+    }
+
+    return OK;
+}
+
+static int spawn_traced_child(const char *exe_path, const fd_descriptor_t *fds,
+                              uint32_t fd_count, const char *pool) {
     // read_snapshot_metadata terminated the path using the length from the
     // header, so here it only has to be copied into a writable argv
     char argv0[PATH_MAX];
     snprintf(argv0, sizeof(argv0), "%s", exe_path);
 
     char *args[] = {argv0, NULL};
+
+    // nothing is traced yet, so a failure here ends the child before the exec
+    // and the parent sees it exit instead of stop
+    if (open_snapshot_fds(fds, fd_count, pool) != OK)
+        exit(EXIT_FAILURE);
 
     personality(ADDR_NO_RANDOMIZE);
     ptrace(PTRACE_TRACEME, 0, NULL, NULL);

@@ -2,13 +2,15 @@
 #
 # Restore has to refuse a damaged or hostile snapshot instead of trusting it.
 #
-# Two things are checked here, and neither needs root.
+# Three things are checked here, and none of them needs root.
 #
 # 1. The header carries counts and lengths that index fixed size arrays, so a
 #    file that lies about them used to walk past the end of
 #    ksnap_dump_header_t. These cases are rejected by read_snapshot_metadata,
 #    before the fork and before any ptrace call.
-# 2. A restore that fails halfway must kill the process it was building. The
+# 2. The fd table names files the child opens before its exec, as root under
+#    sudo, so it is held to the same standard by read_fd_table.
+# 3. A restore that fails halfway must kill the process it was building. The
 #    child is forked from Ksnap and traced as its own child, so this part needs
 #    no privileges either.
 
@@ -47,6 +49,9 @@ trap cleanup EXIT
 # The layout mirrors ksnap_dump_header_t in include/dump_format.h. If that
 # struct changes, these cases stop proving what they claim and the format
 # version has to be bumped anyway, so the duplication is deliberate.
+#
+# fds=FD:FLAGS:DUP_OF:PATH,... writes an fd table and a path pool holding those
+# paths. fd_path_offset and fd_path_len override the first entry.
 write_snapshot() {
     local path="$1"
     shift
@@ -59,6 +64,7 @@ MAX_KERNEL_MAPS = 4
 REGS = 27
 PAGE = 4096
 VMA_SIZE = 48  # sizeof(vma_descriptor_t), asserted in dump_format.h
+FD_SIZE = 32  # sizeof(fd_descriptor_t), asserted in dump_format.h
 XSTATE = 576  # KSNAP_XSTATE_MIN_SIZE, the smallest XSAVE area accepted
 
 HEADER = (
@@ -66,18 +72,47 @@ HEADER = (
     + "QQ32s" * MAX_KERNEL_MAPS
     + "%dQ" % REGS
     + "QII"
+    + "QII"
 )
+
+overrides = {}
+for argument in sys.argv[2:]:
+    key, value = argument.split("=", 1)
+    overrides[key] = value
+
+# fd, flags, dup_of, path - one fd_descriptor_t each
+fds = []
+for spec in filter(None, overrides.pop("fds", "").split(",")):
+    fd, flags, dup_of, path = spec.split(":", 3)
+    fds.append([int(fd), int(flags), int(dup_of), path.encode()])
+
+pool = b""
+for entry in fds:
+    entry.append(len(pool))  # path_offset
+    entry.append(len(entry[3]))  # path_len
+    pool += entry[3] + b"\0"
+
+for key in ("fd_path_offset", "fd_path_len"):
+    if key in overrides:
+        fds[0][4 if key == "fd_path_offset" else 5] = int(overrides.pop(key))
+
+HEADER_SIZE = struct.calcsize(HEADER)
+fd_table_offset = HEADER_SIZE + VMA_SIZE
+pool_offset = fd_table_offset + FD_SIZE * len(fds)
+xstate_offset = pool_offset + len(pool)
 
 fields = {
     "magic": b"KSNAPDMP",
-    "version": 3,
+    "version": 4,
     "vma_count": 1,
-    "vma_table_offset": struct.calcsize(HEADER),
-    "path_pool_offset": struct.calcsize(HEADER) + VMA_SIZE,
-    "path_pool_size": 0,
-    "xstate_offset": struct.calcsize(HEADER) + VMA_SIZE,
+    "vma_table_offset": HEADER_SIZE,
+    "fd_count": len(fds),
+    "fd_table_offset": fd_table_offset,
+    "path_pool_offset": pool_offset,
+    "path_pool_size": len(pool),
+    "xstate_offset": xstate_offset,
     "xstate_size": XSTATE,
-    "data_offset": struct.calcsize(HEADER) + VMA_SIZE + XSTATE,
+    "data_offset": xstate_offset + XSTATE,
     "exe_path": b"/bin/counter",
     # derived from exe_path unless a case overrides it on purpose
     "exe_path_len": None,
@@ -87,12 +122,12 @@ fields = {
     "vma": 0,
     # PROT_* of that descriptor
     "prot": 0x7,
-    # how many filler bytes to put behind the header
-    "body": VMA_SIZE + XSTATE + PAGE,
+    # how many filler bytes to put behind the header, by default exactly what
+    # the layout above needs
+    "body": None,
 }
 
-for argument in sys.argv[2:]:
-    key, value = argument.split("=", 1)
+for key, value in overrides.items():
     if key not in fields:
         raise SystemExit("unknown field %s" % key)
     if key == "exe_path":
@@ -122,13 +157,16 @@ header = struct.pack(
     fields["xstate_offset"],
     fields["xstate_size"],
     0,
+    fields["fd_table_offset"],
+    fields["fd_count"],
+    0,
 )
 
 if fields["vma"]:
     # start_address, size, file_offset, data_offset, prot, map_flags,
     # path_offset, path_len - vma_descriptor_t in include/dump_format.h.
     # 0x1000 is below vm.mmap_min_addr, so the injected mmap is refused.
-    body = struct.pack(
+    vma = struct.pack(
         "<QQQQIIII",
         0x1000,
         PAGE,
@@ -138,7 +176,19 @@ if fields["vma"]:
         0x22,
         0,
         0,
-    ) + b"\0" * (XSTATE + PAGE)
+    )
+else:
+    vma = b"\0" * VMA_SIZE
+
+# fd, dup_of, flags, path_offset, path_len, reserved, position -
+# fd_descriptor_t in include/dump_format.h
+table = b"".join(
+    struct.pack("<iiIIIIQ", fd, dup_of, flags, offset, length, 0, 0)
+    for fd, flags, dup_of, _, offset, length in fds
+)
+
+if fields["body"] is None:
+    body = vma + table + pool + b"\0" * (XSTATE + PAGE)
 else:
     body = b"\0" * fields["body"]
 
@@ -219,15 +269,94 @@ write_snapshot "$WORK_DIR/badprot.ksnap" vma=1 prot=255
 refused_with badprot.ksnap "unknown protection" "a mapping with an unknown protection"
 
 # ------------------------------------------------------------------------------
+# The fd table
+
+# the table promises more entries than the file holds
+write_snapshot "$WORK_DIR/fdcount.ksnap" fd_count=1000000
+refused_with fdcount.ksnap "truncated" "an fd table past the end of the file"
+
+write_snapshot "$WORK_DIR/fdpool.ksnap" "fds=3:0:-1:/etc/hostname" \
+    path_pool_size=0
+refused_with fdpool.ksnap "no path pool" "descriptors without a path pool"
+
+write_snapshot "$WORK_DIR/fdstdio.ksnap" "fds=1:0:-1:/etc/hostname"
+refused_with fdstdio.ksnap "stdio" "a descriptor over stdio"
+
+write_snapshot "$WORK_DIR/fdorder.ksnap" \
+    "fds=4:0:-1:/etc/hostname,3:0:-1:/etc/hostname"
+refused_with fdorder.ksnap "ascending order" "descriptors out of order"
+
+write_snapshot "$WORK_DIR/fdtwice.ksnap" \
+    "fds=3:0:-1:/etc/hostname,3:0:-1:/etc/hostname"
+refused_with fdtwice.ksnap "ascending order" "one descriptor number twice"
+
+write_snapshot "$WORK_DIR/fdduplater.ksnap" \
+    "fds=3:0:-1:/etc/hostname,4:0:5:/etc/hostname"
+refused_with fdduplater.ksnap "share the open file" \
+    "a dup of a descriptor that comes later"
+
+write_snapshot "$WORK_DIR/fddupmissing.ksnap" \
+    "fds=3:0:-1:/etc/hostname,5:0:4:/etc/hostname"
+refused_with fddupmissing.ksnap "share the open file" \
+    "a dup of a descriptor that is not in the table"
+
+# O_TRUNC, the kernel strips it after open, so only a crafted file has it
+write_snapshot "$WORK_DIR/fdtrunc.ksnap" "fds=3:$((0x201)):-1:/etc/hostname"
+refused_with fdtrunc.ksnap "create or truncate" "a descriptor that would truncate"
+
+# O_CREAT
+write_snapshot "$WORK_DIR/fdcreat.ksnap" "fds=3:$((0x41)):-1:/etc/hostname"
+refused_with fdcreat.ksnap "create or truncate" "a descriptor that would create"
+
+write_snapshot "$WORK_DIR/fdoffset.ksnap" "fds=3:0:-1:/etc/hostname" \
+    fd_path_offset=9999
+refused_with fdoffset.ksnap "outside the path pool" "a path past the pool"
+
+write_snapshot "$WORK_DIR/fdnolen.ksnap" "fds=3:0:-1:/etc/hostname" \
+    fd_path_len=0
+refused_with fdnolen.ksnap "outside the path pool" "an empty path"
+
+# the pool holds '/etc/hostname\0', a length of 4 leaves no terminator after it
+write_snapshot "$WORK_DIR/fdnonul.ksnap" "fds=3:0:-1:/etc/hostname" \
+    fd_path_len=4
+refused_with fdnonul.ksnap "malformed path" "a path that is not terminated"
+
+# ------------------------------------------------------------------------------
+# A file the snapshot names but that is gone ends the child before its exec
+#
+# The child reopens the files between the fork and the exec, so there is no
+# program running yet that could be released or would have to be killed.
+
+[ -x "$VICTIM_SOURCE" ] || fail "$VICTIM_SOURCE not found"
+cp "$VICTIM_SOURCE" "$WORK_DIR/$VICTIM_NAME"
+
+write_snapshot "$WORK_DIR/fdgone.ksnap" "exe_path=$WORK_DIR/$VICTIM_NAME" \
+    "fds=3:0:-1:$WORK_DIR/no-such-file"
+
+OUTPUT="$("$KSNAP" -m Restore -d "$WORK_DIR" -n fdgone.ksnap 2>&1)"
+STATUS=$?
+
+[ "$STATUS" -ne 0 ] || fail "a restore whose file is gone reported success"
+[ "$STATUS" -lt 128 ] ||
+    fail "the engine died on signal $((STATUS - 128)): $OUTPUT"
+echo "$OUTPUT" | grep -q "cannot reopen descriptor 3" ||
+    fail "the missing file was not named: $OUTPUT"
+echo "$OUTPUT" | grep -q "did not stop for the restore" ||
+    fail "the engine did not notice the child gave up: $OUTPUT"
+pass "a missing file ends the restore before the exec"
+
+sleep 0.5
+[ "$(pgrep -x "$VICTIM_NAME" | wc -l)" -eq 0 ] ||
+    fail "$VICTIM_NAME runs although its file was missing"
+pass "nothing is left running afterwards"
+
+# ------------------------------------------------------------------------------
 # A restore that fails after the fork must not release what it built
 #
 # The mapping below sits at 0x1000, under vm.mmap_min_addr, so the mmap injected
 # into the child is refused and the restore fails with the child already
 # exec'ed. Releasing it there would run the victim, and under sudo it would run
 # as root.
-
-[ -x "$VICTIM_SOURCE" ] || fail "$VICTIM_SOURCE not found"
-cp "$VICTIM_SOURCE" "$WORK_DIR/$VICTIM_NAME"
 
 write_snapshot "$WORK_DIR/badvma.ksnap" \
     "exe_path=$WORK_DIR/$VICTIM_NAME" vma=1
